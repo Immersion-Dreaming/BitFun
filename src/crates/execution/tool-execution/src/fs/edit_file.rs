@@ -63,6 +63,57 @@ pub fn is_edit_content_guardrail_error(error: &str) -> bool {
 pub fn edit_success_message(logical_path: &str) -> String {
     format!("Successfully edited {}", logical_path)
 }
+/// Lines of context shown before/after the edited region in the success message.
+pub const EDIT_CONTEXT_PADDING: usize = 3;
+
+/// Build a cat -n formatted snippet of the edited region from the post-edit content.
+///
+/// Returns `None` when line information is unavailable (e.g. empty content),
+/// in which case the caller falls back to the plain success message.
+pub fn build_edit_context_snippet(
+    new_content: &str,
+    start_line: usize,
+    new_end_line: usize,
+) -> Option<String> {
+    if start_line == 0 || new_content.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = new_content.split('\n').collect();
+    let total = lines.len();
+    if total == 0 || start_line > total {
+        return None;
+    }
+    let ctx_start = start_line.saturating_sub(EDIT_CONTEXT_PADDING).max(1);
+    let ctx_end = (new_end_line + EDIT_CONTEXT_PADDING).min(total);
+    let mut out = String::new();
+    for (i, line) in lines[ctx_start - 1..ctx_end].iter().enumerate() {
+        let lineno = ctx_start + i;
+        out.push_str(&format!("{:>6}\t{}", lineno, line));
+        if i < ctx_end - ctx_start {
+            out.push('\n');
+        }
+    }
+    Some(out)
+}
+
+/// Success message that includes the post-edit context around the edited region.
+///
+/// This lets the agent see the result of the edit without needing a follow-up Read,
+/// directly targeting the "Edit -> Read current state" pattern.
+pub fn edit_success_message_with_context(
+    logical_path: &str,
+    new_content: &str,
+    start_line: usize,
+    new_end_line: usize,
+) -> String {
+    match build_edit_context_snippet(new_content, start_line, new_end_line) {
+        Some(snippet) => format!(
+            "Successfully edited {}. The edited region (lines {}-{}) now looks like:\n<file_content>\n{}\n</file_content>",
+            logical_path, start_line, new_end_line, snippet
+        ),
+        None => format!("Successfully edited {}", logical_path),
+    }
+}
 
 /// Count lines before given byte position (line numbers start from 1)
 fn count_lines_before(content: &str, byte_pos: usize) -> usize {
@@ -505,7 +556,7 @@ pub fn edit_local_file_with_content(
 mod tests {
     use super::{
         apply_edit_to_content, edit_file, edit_success_message, is_edit_content_guardrail_error,
-        sanitize_read_tool_copied_text, EditResult,
+        edit_success_message_with_context, sanitize_read_tool_copied_text, EditResult,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -609,6 +660,23 @@ mod tests {
             edit_success_message("src/lib.rs"),
             "Successfully edited src/lib.rs"
         );
+    }
+
+    #[test]
+    fn edit_success_message_with_context_includes_edited_region() {
+        let content = "line1\nline2\nline3\nline4\nline5\nline6\nline7";
+        let msg = edit_success_message_with_context("src/main.rs", content, 3, 4);
+        assert!(msg.contains("Successfully edited src/main.rs"));
+        assert!(msg.contains("lines 3-4"));
+        assert!(msg.contains("<file_content>"));
+        assert!(msg.contains("line1"));
+        assert!(msg.contains("line7"));
+    }
+
+    #[test]
+    fn edit_success_message_with_context_falls_back_when_no_lines() {
+        let msg = edit_success_message_with_context("empty.rs", "", 0, 0);
+        assert_eq!(msg, "Successfully edited empty.rs");
     }
 
     #[test]

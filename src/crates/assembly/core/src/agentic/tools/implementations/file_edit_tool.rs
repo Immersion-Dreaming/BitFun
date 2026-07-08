@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::Path;
 use tool_runtime::fs::edit_file::{
-    apply_edit_to_content, edit_local_file_with_content, edit_success_message,
+    apply_edit_to_content, edit_local_file_with_content, edit_success_message_with_context,
     is_edit_content_guardrail_error, EditLocalFileWithContentRequest,
 };
 
@@ -364,7 +364,12 @@ impl Tool for FileEditTool {
                     "old_end_line": edit_result.edit_result.old_end_line,
                     "new_end_line": edit_result.edit_result.new_end_line,
                 }),
-                result_for_assistant: Some(edit_success_message(&resolved.logical_path)),
+                result_for_assistant: Some(edit_success_message_with_context(
+                    &resolved.logical_path,
+                    &edit_result.new_content,
+                    edit_result.edit_result.start_line,
+                    edit_result.edit_result.new_end_line,
+                )),
                 image_attachments: None,
             };
             return Ok(vec![result]);
@@ -413,7 +418,12 @@ impl Tool for FileEditTool {
                 "old_end_line": edit_result.edit_result.old_end_line,
                 "new_end_line": edit_result.edit_result.new_end_line,
             }),
-            result_for_assistant: Some(edit_success_message(&resolved.logical_path)),
+            result_for_assistant: Some(edit_success_message_with_context(
+                &resolved.logical_path,
+                &edit_result.new_content,
+                edit_result.edit_result.start_line,
+                edit_result.edit_result.new_end_line,
+            )),
             image_attachments: None,
         };
 

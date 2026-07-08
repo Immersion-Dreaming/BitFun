@@ -105,12 +105,23 @@ pub fn edit_success_message_with_context(
     new_content: &str,
     start_line: usize,
     new_end_line: usize,
+    match_count: usize,
 ) -> String {
     match build_edit_context_snippet(new_content, start_line, new_end_line) {
-        Some(snippet) => format!(
-            "Successfully edited {}. The edited region (lines {}-{}) now looks like:\n<file_content>\n{}\n</file_content>",
-            logical_path, start_line, new_end_line, snippet
-        ),
+        Some(snippet) => {
+            let region_label = if match_count > 1 {
+                format!(
+                    "the first edited region (of {} matches, lines {}-{})",
+                    match_count, start_line, new_end_line
+                )
+            } else {
+                format!("the edited region (lines {}-{})", start_line, new_end_line)
+            };
+            format!(
+                "Successfully edited {}. The file now shows {}:\n<file_content>\n{}\n</file_content>",
+                logical_path, region_label, snippet
+            )
+        }
         None => format!("Successfully edited {}", logical_path),
     }
 }
@@ -555,8 +566,9 @@ pub fn edit_local_file_with_content(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_edit_to_content, edit_file, edit_success_message, is_edit_content_guardrail_error,
-        edit_success_message_with_context, sanitize_read_tool_copied_text, EditResult,
+        apply_edit_to_content, edit_file, edit_success_message,
+        edit_success_message_with_context, is_edit_content_guardrail_error,
+        sanitize_read_tool_copied_text, EditResult,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -665,7 +677,7 @@ mod tests {
     #[test]
     fn edit_success_message_with_context_includes_edited_region() {
         let content = "line1\nline2\nline3\nline4\nline5\nline6\nline7";
-        let msg = edit_success_message_with_context("src/main.rs", content, 3, 4);
+        let msg = edit_success_message_with_context("src/main.rs", content, 3, 4, 1);
         assert!(msg.contains("Successfully edited src/main.rs"));
         assert!(msg.contains("lines 3-4"));
         assert!(msg.contains("<file_content>"));
@@ -675,7 +687,7 @@ mod tests {
 
     #[test]
     fn edit_success_message_with_context_falls_back_when_no_lines() {
-        let msg = edit_success_message_with_context("empty.rs", "", 0, 0);
+        let msg = edit_success_message_with_context("empty.rs", "", 0, 0, 1);
         assert_eq!(msg, "Successfully edited empty.rs");
     }
 

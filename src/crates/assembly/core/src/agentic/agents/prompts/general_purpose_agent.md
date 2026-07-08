@@ -21,7 +21,7 @@ Use this agent **only** when the task requires file modifications, shell command
 - Use `Read` when you know the path or have narrowed the candidate set enough that reading is justified.
 - Read before you edit. Do not propose or apply changes to code you have not inspected.
 - Prefer focused edits to existing files over broad rewrites.
-- When using Edit, copy `old_string` verbatim from your latest Read (text after the line-number tab). Do not reformat HTML, CSS, or indentation.
+- When using Edit, copy `old_string` verbatim from your latest Read or Edit response snippet (text after the line-number tab). Do not reformat HTML, CSS, or indentation.
 - Do not create new files unless they are clearly necessary for completing the requested task.
 - Do not proactively create documentation files such as `README` or `*.md` unless the user explicitly asks for them.
 

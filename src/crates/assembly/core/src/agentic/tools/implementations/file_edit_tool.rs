@@ -23,17 +23,18 @@ pub struct FileEditTool;
 const EDIT_TOOL_PROMPT: &str = r#"Performs exact string replacements in files.
 
 Usage:
-- You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file.
+- You must use your `Read` tool at least once per file in the conversation before editing it. This tool will error if you attempt an edit without having read the file at least once. Once you have read a file, subsequent Edits do not require a fresh Read — the success message shows the post-edit state.
 - The `file_path` parameter must be a workspace-relative path, an absolute path inside the current workspace, or an exact `bitfun://runtime/...` URI returned by another tool.
 - When editing text from Read tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: spaces + line number + tab. Everything after that is the actual file content to match. Never include any part of the line number prefix in the old_string or new_string.
-- Copy `old_string` verbatim from your latest Read of this file. Do not reformat HTML/CSS/JS, do not normalize indentation, and do not reconstruct the block from memory.
+- Copy `old_string` verbatim from your latest view of this file — either a `Read` result or the post-edit snippet returned by a previous `Edit`. Do not reformat HTML/CSS/JS, do not normalize indentation, and do not reconstruct the block from memory.
 - Use the smallest `old_string` that is clearly unique — usually 2-4 adjacent lines with stable surrounding context is sufficient.
 - If Read output was truncated or used start_line/limit, re-read until the full target block is visible before editing.
 - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
 - Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.
 - The edit will FAIL if `old_string` is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use `replace_all` to change every instance of `old_string`.
 - Use `replace_all` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.
-- If an edit fails because the text was not found, call Read again on the target lines and retry with a freshly copied `old_string`."#;
+- If an edit FAILS, the success message is not returned — call Read on the target lines and retry with a freshly copied `old_string`. Do not retry by guessing.
+- On SUCCESS, the tool returns the post-edit content of the edited region (with surrounding context, in the same format as Read output). You do NOT need to call Read to verify a successful edit — the returned snippet already shows the result. Only call Read again if you need to inspect content OUTSIDE the returned region (e.g. a caller of the function you edited, or lines beyond the surrounding context shown)."#;
 
 impl Default for FileEditTool {
     fn default() -> Self {
@@ -369,6 +370,7 @@ impl Tool for FileEditTool {
                     &edit_result.new_content,
                     edit_result.edit_result.start_line,
                     edit_result.edit_result.new_end_line,
+                    edit_result.match_count,
                 )),
                 image_attachments: None,
             };
@@ -423,6 +425,7 @@ impl Tool for FileEditTool {
                 &edit_result.new_content,
                 edit_result.edit_result.start_line,
                 edit_result.edit_result.new_end_line,
+                edit_result.match_count,
             )),
             image_attachments: None,
         };

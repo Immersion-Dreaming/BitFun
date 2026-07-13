@@ -18,7 +18,7 @@ export interface ContextCompressionCardProps extends Omit<BaseToolCardProps, 'to
   compressionRatio?: number;
   duration?: number;
   summaryContent?: string;
-  trigger?: 'user_message' | 'tool_batch' | 'ai_response' | 'manual';
+  trigger?: 'user_message' | 'tool_batch' | 'ai_response' | 'manual' | 'auto_local';
   compressionTiers?: {
     tier1?: { before: number; after: number; saved: number };
     tier2_3?: { before: number; after: number; saved: number };

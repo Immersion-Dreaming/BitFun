@@ -192,6 +192,12 @@ pub enum AgenticEvent {
         trigger: String,
         tokens_before: usize,
         context_window: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tier: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_limit: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pressure_ratio: Option<f32>,
     },
 
     ContextCompressionCompleted {
@@ -205,6 +211,18 @@ pub enum AgenticEvent {
         duration_ms: u64,
         has_summary: bool,
         summary_source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tier: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_limit: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_saved: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        items_snipped: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        items_pruned: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protected_messages: Option<usize>,
     },
 
     ContextCompressionFailed {

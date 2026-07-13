@@ -17,13 +17,13 @@ interface ContextCompressionDisplayProps {
     session_id: string;
     compression_count: number;
     has_summary: boolean;
-    summary_source?: 'model' | 'local_fallback' | 'none';
+    summary_source?: 'model' | 'local_fallback' | 'local_compaction' | 'none';
     tokens_before?: number;
     tokens_after?: number;
     compression_ratio?: number;
     duration?: number;
     summary_content?: string;
-    trigger?: 'user_message' | 'tool_batch' | 'ai_response' | 'manual';
+    trigger?: 'user_message' | 'tool_batch' | 'ai_response' | 'manual' | 'auto_local';
     compression_tiers?: {
       tier1?: { before: number; after: number; saved: number };
       tier2_3?: { before: number; after: number; saved: number };

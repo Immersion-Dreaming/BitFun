@@ -5,6 +5,7 @@
 
 pub mod agents;
 pub mod checkpoint;
+pub mod context_compaction;
 pub mod context_profile;
 pub mod custom_agent;
 pub mod custom_subagent;

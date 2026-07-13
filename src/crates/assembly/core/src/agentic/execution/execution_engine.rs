@@ -44,7 +44,11 @@ use crate::util::token_counter::TokenCounter;
 use crate::util::types::Message as AIMessage;
 use crate::util::types::ToolDefinition;
 use crate::util::{elapsed_ms_u64, truncate_at_char_boundary};
+use bitfun_agent_runtime::context_compaction::{ContextCompactionPolicy, ContextCompactionTier};
 use bitfun_agent_runtime::remote_file_delivery::TOOL_CONTEXT_REMOTE_FILE_DELIVERY_KEY;
+use bitfun_agent_tools::{
+    generate_tool_result_preview, tool_result_is_persisted_output, GET_TOOL_SPEC_TOOL_NAME,
+};
 use bitfun_ai_adapters::ModelExchangeTraceConfig;
 use log::{debug, error, info, trace, warn};
 use sha2::{Digest, Sha256};
@@ -83,6 +87,26 @@ pub struct ContextCompactionOutcome {
     pub summary_source: String,
     pub applied: bool,
 }
+
+#[derive(Debug, Clone, Default)]
+struct LocalContextCompactionStats {
+    changed_messages: usize,
+    snipped_tool_results: usize,
+    pruned_tool_results: usize,
+    protected_messages: usize,
+    tokens_before: usize,
+    tokens_after: usize,
+}
+
+impl LocalContextCompactionStats {
+    fn has_changes(&self) -> bool {
+        self.changed_messages > 0
+    }
+}
+
+const LOCAL_CONTEXT_COMPACTION_TAG: &str = "<context-compaction>";
+const LOCAL_CONTEXT_COMPACTION_CLOSING_TAG: &str = "</context-compaction>";
+const LOCAL_CONTEXT_COMPACTION_TRIGGER: &str = "auto_local";
 
 struct CompressionRuntimeScaffold {
     ai_client: Arc<crate::infrastructure::ai::AIClient>,
@@ -549,6 +573,204 @@ impl ExecutionEngine {
             .iter()
             .map(|message| message.estimate_tokens_with_reasoning(true))
             .sum()
+    }
+
+    fn input_pressure_ratio(total_tokens: usize, input_limit: usize) -> f32 {
+        if input_limit == 0 {
+            0.0
+        } else {
+            total_tokens as f32 / input_limit as f32
+        }
+    }
+
+    fn apply_local_context_compaction(
+        messages: &mut [Message],
+        tier: ContextCompactionTier,
+        policy: ContextCompactionPolicy,
+    ) -> LocalContextCompactionStats {
+        if !tier.is_local() {
+            return LocalContextCompactionStats::default();
+        }
+
+        let tokens_before = Self::estimate_tail_tokens(messages);
+        let protected_start = Self::local_compaction_protected_start(messages, policy);
+        let mut stats = LocalContextCompactionStats {
+            protected_messages: messages.len().saturating_sub(protected_start),
+            tokens_before,
+            ..LocalContextCompactionStats::default()
+        };
+
+        for (index, message) in messages.iter_mut().enumerate() {
+            if index >= protected_start {
+                continue;
+            }
+
+            if Self::compact_tool_result_visible_content(message, tier, policy) {
+                stats.changed_messages += 1;
+                match tier {
+                    ContextCompactionTier::Snip => stats.snipped_tool_results += 1,
+                    ContextCompactionTier::Prune => stats.pruned_tool_results += 1,
+                    _ => {}
+                }
+            }
+        }
+
+        stats.tokens_after = Self::estimate_tail_tokens(messages);
+        stats
+    }
+
+    fn local_compaction_protected_start(
+        messages: &[Message],
+        policy: ContextCompactionPolicy,
+    ) -> usize {
+        let mut token_protected_start = messages.len();
+        let mut protected_tokens = 0usize;
+        for (index, message) in messages.iter().enumerate().rev() {
+            protected_tokens =
+                protected_tokens.saturating_add(message.estimate_tokens_with_reasoning(true));
+            token_protected_start = index;
+            if protected_tokens >= policy.protected_tail_tokens {
+                break;
+            }
+        }
+
+        let mut user_turn_protected_start = messages.len();
+        let mut user_turns = 0usize;
+        for (index, message) in messages.iter().enumerate().rev() {
+            if message.is_actual_user_message() {
+                user_turns += 1;
+                user_turn_protected_start = index;
+                if user_turns >= policy.protected_recent_user_turns {
+                    break;
+                }
+            }
+        }
+
+        token_protected_start.min(user_turn_protected_start)
+    }
+
+    fn compact_tool_result_visible_content(
+        message: &mut Message,
+        tier: ContextCompactionTier,
+        policy: ContextCompactionPolicy,
+    ) -> bool {
+        let MessageContent::ToolResult {
+            tool_id,
+            tool_name,
+            result,
+            result_for_assistant,
+            image_attachments,
+            ..
+        } = &mut message.content
+        else {
+            return false;
+        };
+
+        if image_attachments
+            .as_ref()
+            .is_some_and(|images| !images.is_empty())
+        {
+            return false;
+        }
+
+        if Self::local_compaction_protected_tool(tool_name) {
+            return false;
+        }
+
+        let visible_text = result_for_assistant
+            .as_ref()
+            .filter(|text| !text.is_empty())
+            .cloned()
+            .or_else(|| serde_json::to_string(result).ok())
+            .unwrap_or_else(|| tool_name.clone());
+
+        if tool_result_is_persisted_output(&visible_text) {
+            return false;
+        }
+
+        if Self::local_context_compaction_marker_tier(&visible_text) == Some(tier) {
+            return false;
+        }
+
+        let visible_chars = visible_text.chars().count();
+        if visible_chars < policy.min_tool_result_chars
+            && Self::local_context_compaction_marker_tier(&visible_text).is_none()
+        {
+            return false;
+        }
+
+        let preview_chars = match tier {
+            ContextCompactionTier::Snip => policy.snip_preview_chars,
+            ContextCompactionTier::Prune => policy.prune_preview_chars,
+            _ => return false,
+        };
+        let (preview, has_more) = generate_tool_result_preview(&visible_text, preview_chars);
+        let replacement = Self::render_local_compacted_tool_result(
+            tier,
+            tool_name,
+            tool_id,
+            visible_chars,
+            preview_chars,
+            &preview,
+            has_more,
+        );
+
+        *result_for_assistant = Some(replacement);
+        message.metadata.tokens = None;
+        true
+    }
+
+    fn local_compaction_protected_tool(tool_name: &str) -> bool {
+        matches!(tool_name, "Task" | "Skill" | "AskUserQuestion")
+            || tool_name == GET_TOOL_SPEC_TOOL_NAME
+    }
+
+    fn local_context_compaction_marker_tier(text: &str) -> Option<ContextCompactionTier> {
+        if !text.starts_with(LOCAL_CONTEXT_COMPACTION_TAG) {
+            return None;
+        }
+        if text.contains("Tier: snip") {
+            Some(ContextCompactionTier::Snip)
+        } else if text.contains("Tier: prune") {
+            Some(ContextCompactionTier::Prune)
+        } else {
+            None
+        }
+    }
+
+    fn render_local_compacted_tool_result(
+        tier: ContextCompactionTier,
+        tool_name: &str,
+        tool_id: &str,
+        original_chars: usize,
+        preview_chars: usize,
+        preview: &str,
+        has_more: bool,
+    ) -> String {
+        let mut message = format!(
+            "{LOCAL_CONTEXT_COMPACTION_TAG}\nTool result locally compacted to protect context.\nTier: {}\nTool: {}\nTool call id: {}\nOriginal visible chars: {}\nPreview chars: {}\n\nPreview:\n{}",
+            tier.as_str(),
+            tool_name,
+            tool_id,
+            original_chars,
+            preview_chars,
+            preview
+        );
+        if has_more {
+            message.push_str("\n...\n");
+        } else {
+            message.push('\n');
+        }
+        message.push_str(LOCAL_CONTEXT_COMPACTION_CLOSING_TAG);
+        message
+    }
+
+    fn persistent_context_messages(messages: &[Message]) -> Vec<Message> {
+        messages
+            .iter()
+            .filter(|message| message.role != MessageRole::System)
+            .cloned()
+            .collect()
     }
 
     fn apply_token_delta(base: usize, old: usize, new: usize) -> usize {
@@ -1930,6 +2152,12 @@ impl ExecutionEngine {
                 trigger: "auto".to_string(),
                 tokens_before: before_pressure.total_tokens,
                 context_window,
+                tier: Some(ContextCompactionTier::Summarize.as_str().to_string()),
+                input_limit: Some(before_pressure.input_limit),
+                pressure_ratio: Some(Self::input_pressure_ratio(
+                    before_pressure.total_tokens,
+                    before_pressure.input_limit,
+                )),
             },
             EventPriority::Normal,
         )
@@ -2114,6 +2342,16 @@ impl ExecutionEngine {
                         duration_ms,
                         has_summary: compression_result.has_model_summary,
                         summary_source: summary_source.to_string(),
+                        tier: Some(ContextCompactionTier::Summarize.as_str().to_string()),
+                        input_limit: Some(before_pressure.input_limit),
+                        tokens_saved: Some(
+                            before_pressure
+                                .total_tokens
+                                .saturating_sub(compressed_tokens),
+                        ),
+                        items_snipped: None,
+                        items_pruned: None,
+                        protected_messages: None,
                     },
                     EventPriority::Normal,
                 )
@@ -2184,6 +2422,12 @@ impl ExecutionEngine {
                 trigger: trigger.to_string(),
                 tokens_before: before_pressure.total_tokens,
                 context_window,
+                tier: Some(ContextCompactionTier::Summarize.as_str().to_string()),
+                input_limit: Some(before_pressure.input_limit),
+                pressure_ratio: Some(Self::input_pressure_ratio(
+                    before_pressure.total_tokens,
+                    before_pressure.input_limit,
+                )),
             },
             EventPriority::Normal,
         )
@@ -2230,6 +2474,12 @@ impl ExecutionEngine {
                     duration_ms,
                     has_summary: false,
                     summary_source: "none".to_string(),
+                    tier: Some(ContextCompactionTier::None.as_str().to_string()),
+                    input_limit: Some(before_pressure.input_limit),
+                    tokens_saved: Some(0),
+                    items_snipped: None,
+                    items_pruned: None,
+                    protected_messages: None,
                 },
                 EventPriority::Normal,
             )
@@ -2416,6 +2666,14 @@ impl ExecutionEngine {
                         } else {
                             "local_fallback".to_string()
                         },
+                        tier: Some(ContextCompactionTier::Summarize.as_str().to_string()),
+                        input_limit: Some(before_pressure.input_limit),
+                        tokens_saved: Some(
+                            before_pressure.total_tokens.saturating_sub(tokens_after),
+                        ),
+                        items_snipped: None,
+                        items_pruned: None,
+                        protected_messages: None,
                     },
                     EventPriority::Normal,
                 )
@@ -2822,7 +3080,10 @@ impl ExecutionEngine {
             // drove repetitive tool-call loops in long exploratory subagents
             // (see deep-review subagent loop incident, 2026-05-12).
             //
-            // The remaining context-pressure layers are:
+            // The current context-pressure layers are:
+            //   - L0: Stable local tool-result compaction at watermarks below
+            //         full overflow. It protects the recent tail and only
+            //         rewrites model-visible tool-result text.
             //   - L1: AI-summary based full compression (preserves semantics).
             //   - L2: Emergency truncation (only if tokens still exceed the
             //         provider context window after L1).
@@ -2835,7 +3096,7 @@ impl ExecutionEngine {
                 .session_manager
                 .select_latest_matching_token_anchor(&context.session_id, &messages)
                 .await;
-            let (token_pressure, anchor_details) =
+            let (mut token_pressure, anchor_details) =
                 Self::estimate_auto_compression_pressure_with_anchor(
                     &messages,
                     tool_definitions.as_deref(),
@@ -2917,9 +3178,134 @@ impl ExecutionEngine {
                 token_pressure.safety_reserve_tokens
             );
 
+            let mut send_pressure_reusable = true;
+            let compaction_policy = ContextCompactionPolicy::default();
+            let compaction_plan =
+                compaction_policy.plan(token_pressure.total_tokens, token_pressure.input_limit);
+            if enable_context_compression && compaction_plan.tier.is_local() {
+                let local_compression_id = format!("local_compaction_{}", uuid::Uuid::new_v4());
+                let local_start_time = std::time::Instant::now();
+                let before_pressure = token_pressure;
+                let stats = Self::apply_local_context_compaction(
+                    &mut messages,
+                    compaction_plan.tier,
+                    compaction_policy,
+                );
+
+                if stats.has_changes() {
+                    self.emit_event(
+                        AgenticEvent::ContextCompressionStarted {
+                            session_id: context.session_id.clone(),
+                            turn_id: context.dialog_turn_id.clone(),
+                            compression_id: local_compression_id.clone(),
+                            trigger: LOCAL_CONTEXT_COMPACTION_TRIGGER.to_string(),
+                            tokens_before: before_pressure.total_tokens,
+                            context_window,
+                            tier: Some(compaction_plan.tier.as_str().to_string()),
+                            input_limit: Some(before_pressure.input_limit),
+                            pressure_ratio: Some(compaction_plan.pressure_ratio),
+                        },
+                        EventPriority::Normal,
+                    )
+                    .await;
+
+                    self.session_manager
+                        .replace_context_messages(
+                            &context.session_id,
+                            Self::persistent_context_messages(&messages),
+                        )
+                        .await;
+                    self.session_manager
+                        .prune_token_anchors_to_messages(&context.session_id, &messages)
+                        .await;
+                    self.session_manager
+                        .invalidate_prompt_cache(
+                            &context.session_id,
+                            crate::agentic::session::PromptCacheScope::All,
+                            "local_context_compaction_applied",
+                        )
+                        .await;
+
+                    token_pressure = Self::estimate_auto_compression_pressure(
+                        &messages,
+                        tool_definitions.as_deref(),
+                        context_window,
+                        compression_trigger_budget,
+                        pressure_prepended_reminder_tokens,
+                    );
+                    send_pressure_reusable = false;
+
+                    let duration_ms = elapsed_ms_u64(local_start_time);
+                    info!(
+                        "Local context compaction completed: session_id={}, turn_id={}, round_index={}, tier={}, changed_messages={}, snipped_tool_results={}, pruned_tool_results={}, protected_messages={}, total_tokens {} -> {}, estimated_message_tokens {} -> {}, input_limit={}, context_window={}, usage {:.3} -> {:.3}, duration_ms={}",
+                        context.session_id,
+                        context.dialog_turn_id,
+                        round_index,
+                        compaction_plan.tier.as_str(),
+                        stats.changed_messages,
+                        stats.snipped_tool_results,
+                        stats.pruned_tool_results,
+                        stats.protected_messages,
+                        before_pressure.total_tokens,
+                        token_pressure.total_tokens,
+                        stats.tokens_before,
+                        stats.tokens_after,
+                        token_pressure.input_limit,
+                        token_pressure.context_window,
+                        before_pressure.usage_ratio,
+                        token_pressure.usage_ratio,
+                        duration_ms
+                    );
+
+                    self.emit_event(
+                        AgenticEvent::ContextCompressionCompleted {
+                            session_id: context.session_id.clone(),
+                            turn_id: context.dialog_turn_id.clone(),
+                            compression_id: local_compression_id,
+                            compression_count: session.compression_state.compression_count,
+                            tokens_before: before_pressure.total_tokens,
+                            tokens_after: token_pressure.total_tokens,
+                            compression_ratio: if before_pressure.total_tokens == 0 {
+                                1.0
+                            } else {
+                                (token_pressure.total_tokens as f64)
+                                    / (before_pressure.total_tokens as f64)
+                            },
+                            duration_ms,
+                            has_summary: false,
+                            summary_source: "local_compaction".to_string(),
+                            tier: Some(compaction_plan.tier.as_str().to_string()),
+                            input_limit: Some(token_pressure.input_limit),
+                            tokens_saved: Some(
+                                before_pressure
+                                    .total_tokens
+                                    .saturating_sub(token_pressure.total_tokens),
+                            ),
+                            items_snipped: Some(stats.snipped_tool_results),
+                            items_pruned: Some(stats.pruned_tool_results),
+                            protected_messages: Some(stats.protected_messages),
+                        },
+                        EventPriority::Normal,
+                    )
+                    .await;
+                } else {
+                    debug!(
+                        "Local context compaction skipped: session_id={}, turn_id={}, round_index={}, tier={}, reason=no_eligible_messages, total_tokens={}, input_limit={}, context_window={}, protected_tail_tokens={}, protected_recent_user_turns={}",
+                        context.session_id,
+                        context.dialog_turn_id,
+                        round_index,
+                        compaction_plan.tier.as_str(),
+                        token_pressure.total_tokens,
+                        token_pressure.input_limit,
+                        token_pressure.context_window,
+                        compaction_policy.protected_tail_tokens,
+                        compaction_policy.protected_recent_user_turns
+                    );
+                }
+            }
+
             let should_compress = enable_context_compression
                 && token_pressure.total_tokens >= token_pressure.input_limit;
-            let mut send_pressure_reusable = true;
 
             // Circuit breaker: skip full compression if it has failed too many
             // consecutive times.  Microcompact and emergency truncation still run.

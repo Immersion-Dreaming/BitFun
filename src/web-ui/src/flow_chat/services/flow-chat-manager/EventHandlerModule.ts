@@ -2059,10 +2059,14 @@ function handleAcpContextUsageUpdate(event: AcpContextUsageUpdatedEvent): void {
  * Handle context compression started event
  */
 function handleCompressionStarted(_context: FlowChatContext, event: any): void {
-  const { sessionId, turnId, compressionId, trigger, tokensBefore, contextWindow } = event;
+  const {
+    sessionId, turnId, compressionId, trigger, tokensBefore, contextWindow,
+    tier, inputLimit, pressureRatio,
+  } = event;
   
   log.info('Context compression started', {
-    sessionId, turnId, compressionId, trigger, tokensBefore, contextWindow
+    sessionId, turnId, compressionId, trigger, tokensBefore, contextWindow,
+    tier, inputLimit, pressureRatio,
   });
   
   const store = FlowChatStore.getInstance();
@@ -2097,6 +2101,9 @@ function handleCompressionStarted(_context: FlowChatContext, event: any): void {
         trigger,
         tokens_before: tokensBefore,
         context_window: contextWindow,
+        tier,
+        input_limit: inputLimit,
+        pressure_ratio: pressureRatio,
       },
       id: compressionId
     },
@@ -2130,12 +2137,14 @@ function handleCompressionStarted(_context: FlowChatContext, event: any): void {
 function handleCompressionCompleted(context: FlowChatContext, event: any): void {
   const { 
     sessionId, turnId, compressionId, compressionCount, 
-    tokensBefore, tokensAfter, compressionRatio, durationMs, hasSummary, summarySource
+    tokensBefore, tokensAfter, compressionRatio, durationMs, hasSummary, summarySource,
+    tier, inputLimit, tokensSaved, itemsSnipped, itemsPruned, protectedMessages,
   } = event;
   
   log.info('Context compression completed', {
     sessionId, turnId, compressionId, compressionCount, 
-    tokensBefore, tokensAfter, compressionRatio, durationMs
+    tokensBefore, tokensAfter, compressionRatio, durationMs,
+    tier, inputLimit, tokensSaved, itemsSnipped, itemsPruned, protectedMessages,
   });
   
   const store = FlowChatStore.getInstance();
@@ -2150,6 +2159,12 @@ function handleCompressionCompleted(context: FlowChatContext, event: any): void 
         duration: durationMs,
         has_summary: hasSummary,
         summary_source: summarySource,
+        tier,
+        input_limit: inputLimit,
+        tokens_saved: tokensSaved,
+        items_snipped: itemsSnipped,
+        items_pruned: itemsPruned,
+        protected_messages: protectedMessages,
       },
       success: true,
       duration_ms: durationMs || 0

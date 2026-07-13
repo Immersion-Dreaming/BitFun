@@ -437,13 +437,20 @@ export interface CompressionEvent extends AgenticEvent {
   trigger?: string;                // "auto" | "manual" | "user_message"
   tokensBefore?: number;           
   contextWindow?: number;          
+  tier?: 'none' | 'snip' | 'prune' | 'summarize';
+  inputLimit?: number;
+  pressureRatio?: number;
   
   compressionCount?: number;       
   tokensAfter?: number;            
   compressionRatio?: number;       
   durationMs?: number;             
   hasSummary?: boolean;            
-  summarySource?: 'model' | 'local_fallback' | 'none';
+  summarySource?: 'model' | 'local_fallback' | 'local_compaction' | 'none';
+  tokensSaved?: number;
+  itemsSnipped?: number;
+  itemsPruned?: number;
+  protectedMessages?: number;
   
   error?: string;                  
 }

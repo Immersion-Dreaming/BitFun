@@ -44,7 +44,9 @@ use crate::util::token_counter::TokenCounter;
 use crate::util::types::Message as AIMessage;
 use crate::util::types::ToolDefinition;
 use crate::util::{elapsed_ms_u64, truncate_at_char_boundary};
-use bitfun_agent_runtime::context_compaction::{ContextCompactionPolicy, ContextCompactionTier};
+use bitfun_agent_runtime::context_compaction::{
+    ContextCompactionPlan, ContextCompactionPolicy, ContextCompactionTier,
+};
 use bitfun_agent_runtime::remote_file_delivery::TOOL_CONTEXT_REMOTE_FILE_DELIVERY_KEY;
 use bitfun_agent_tools::{
     generate_tool_result_preview, tool_result_is_persisted_output, GET_TOOL_SPEC_TOOL_NAME,
@@ -93,6 +95,9 @@ struct LocalContextCompactionStats {
     changed_messages: usize,
     snipped_tool_results: usize,
     pruned_tool_results: usize,
+    eligible_candidates: usize,
+    expected_saved_tokens: usize,
+    invalidated_suffix_tokens: usize,
     protected_messages: usize,
     tokens_before: usize,
     tokens_after: usize,
@@ -102,6 +107,21 @@ impl LocalContextCompactionStats {
     fn has_changes(&self) -> bool {
         self.changed_messages > 0
     }
+}
+
+#[derive(Debug, Clone)]
+struct LocalContextCompactionCandidate {
+    index: usize,
+    tool_priority: usize,
+    expected_saved_tokens: usize,
+    suffix_tokens: usize,
+}
+
+#[derive(Debug, Clone)]
+struct LocalContextCompactionBatch {
+    indices: Vec<usize>,
+    expected_saved_tokens: usize,
+    invalidated_suffix_tokens: usize,
 }
 
 const LOCAL_CONTEXT_COMPACTION_TAG: &str = "<context-compaction>";
@@ -583,31 +603,60 @@ impl ExecutionEngine {
         }
     }
 
+    fn should_run_full_context_compression(
+        enabled: bool,
+        plan: ContextCompactionPlan,
+        total_tokens: usize,
+        input_limit: usize,
+    ) -> bool {
+        enabled && (plan.tier == ContextCompactionTier::Summarize || total_tokens >= input_limit)
+    }
+
     fn apply_local_context_compaction(
         messages: &mut [Message],
-        tier: ContextCompactionTier,
+        plan: ContextCompactionPlan,
         policy: ContextCompactionPolicy,
+        total_tokens: usize,
+        input_limit: usize,
     ) -> LocalContextCompactionStats {
-        if !tier.is_local() {
+        if !plan.tier.is_local() || plan.max_items == 0 {
             return LocalContextCompactionStats::default();
         }
 
         let tokens_before = Self::estimate_tail_tokens(messages);
         let protected_start = Self::local_compaction_protected_start(messages, policy);
+        let candidates = Self::collect_local_context_compaction_candidates(
+            messages,
+            protected_start,
+            plan.tier,
+            policy,
+        );
         let mut stats = LocalContextCompactionStats {
             protected_messages: messages.len().saturating_sub(protected_start),
             tokens_before,
+            eligible_candidates: candidates.len(),
             ..LocalContextCompactionStats::default()
         };
+        let Some(batch) = Self::select_local_context_compaction_batch(
+            &candidates,
+            plan,
+            policy,
+            total_tokens,
+            input_limit,
+        ) else {
+            stats.tokens_after = tokens_before;
+            return stats;
+        };
 
+        let selected = batch.indices.iter().copied().collect::<HashSet<_>>();
+        stats.expected_saved_tokens = batch.expected_saved_tokens;
+        stats.invalidated_suffix_tokens = batch.invalidated_suffix_tokens;
         for (index, message) in messages.iter_mut().enumerate() {
-            if index >= protected_start {
-                continue;
-            }
-
-            if Self::compact_tool_result_visible_content(message, tier, policy) {
+            if selected.contains(&index)
+                && Self::compact_tool_result_visible_content(message, plan.tier, policy)
+            {
                 stats.changed_messages += 1;
-                match tier {
+                match plan.tier {
                     ContextCompactionTier::Snip => stats.snipped_tool_results += 1,
                     ContextCompactionTier::Prune => stats.pruned_tool_results += 1,
                     _ => {}
@@ -617,6 +666,184 @@ impl ExecutionEngine {
 
         stats.tokens_after = Self::estimate_tail_tokens(messages);
         stats
+    }
+
+    fn collect_local_context_compaction_candidates(
+        messages: &[Message],
+        protected_start: usize,
+        tier: ContextCompactionTier,
+        policy: ContextCompactionPolicy,
+    ) -> Vec<LocalContextCompactionCandidate> {
+        messages
+            .iter()
+            .take(protected_start)
+            .enumerate()
+            .filter_map(|(index, message)| {
+                let tool_priority = Self::local_compaction_tool_priority(message)?;
+                let upgrading_snip = tier == ContextCompactionTier::Prune
+                    && Self::local_compaction_message_tier(message)
+                        == Some(ContextCompactionTier::Snip);
+                let original_tokens = message.estimate_tokens_with_reasoning(true);
+                let mut compacted = message.clone();
+                if !Self::compact_tool_result_visible_content(&mut compacted, tier, policy) {
+                    return None;
+                }
+                let compacted_tokens = compacted.estimate_tokens_with_reasoning(true);
+                let expected_saved_tokens = original_tokens.saturating_sub(compacted_tokens);
+                if expected_saved_tokens == 0
+                    || (!upgrading_snip && expected_saved_tokens < policy.min_expected_saved_tokens)
+                {
+                    return None;
+                }
+
+                Some(LocalContextCompactionCandidate {
+                    index,
+                    tool_priority,
+                    expected_saved_tokens,
+                    suffix_tokens: Self::estimate_tail_tokens(&messages[index..]),
+                })
+            })
+            .collect()
+    }
+
+    fn select_local_context_compaction_batch(
+        candidates: &[LocalContextCompactionCandidate],
+        plan: ContextCompactionPlan,
+        policy: ContextCompactionPolicy,
+        total_tokens: usize,
+        input_limit: usize,
+    ) -> Option<LocalContextCompactionBatch> {
+        if candidates.is_empty() || plan.max_items == 0 {
+            return None;
+        }
+
+        let target_tokens = (input_limit as f64 * plan.target_ratio as f64) as usize;
+        let target_savings = total_tokens.saturating_sub(target_tokens);
+        let mut best: Option<LocalContextCompactionBatch> = None;
+
+        for (start, frontier) in candidates.iter().enumerate() {
+            let mut tail = candidates[start + 1..].iter().collect::<Vec<_>>();
+            tail.sort_by(|left, right| {
+                right
+                    .tool_priority
+                    .cmp(&left.tool_priority)
+                    .then_with(|| right.expected_saved_tokens.cmp(&left.expected_saved_tokens))
+                    .then_with(|| right.index.cmp(&left.index))
+            });
+
+            let mut indices = vec![frontier.index];
+            let mut expected_saved_tokens = frontier.expected_saved_tokens;
+            Self::consider_local_compaction_batch(
+                &mut best,
+                &indices,
+                expected_saved_tokens,
+                frontier.suffix_tokens,
+                target_savings,
+                plan,
+                policy,
+            );
+
+            for candidate in tail.into_iter().take(plan.max_items.saturating_sub(1)) {
+                indices.push(candidate.index);
+                expected_saved_tokens =
+                    expected_saved_tokens.saturating_add(candidate.expected_saved_tokens);
+                Self::consider_local_compaction_batch(
+                    &mut best,
+                    &indices,
+                    expected_saved_tokens,
+                    frontier.suffix_tokens,
+                    target_savings,
+                    plan,
+                    policy,
+                );
+            }
+        }
+
+        best
+    }
+
+    fn consider_local_compaction_batch(
+        best: &mut Option<LocalContextCompactionBatch>,
+        indices: &[usize],
+        expected_saved_tokens: usize,
+        suffix_tokens: usize,
+        target_savings: usize,
+        plan: ContextCompactionPlan,
+        policy: ContextCompactionPolicy,
+    ) {
+        let invalidated_suffix_tokens = suffix_tokens.saturating_sub(expected_saved_tokens);
+        if plan.requires_break_even
+            && expected_saved_tokens.saturating_mul(policy.snip_horizon_rounds)
+                < invalidated_suffix_tokens
+        {
+            return;
+        }
+
+        let candidate = LocalContextCompactionBatch {
+            indices: indices.to_vec(),
+            expected_saved_tokens,
+            invalidated_suffix_tokens,
+        };
+        let candidate_meets_target = expected_saved_tokens >= target_savings;
+        let replace = best.as_ref().is_none_or(|current| {
+            let current_meets_target = current.expected_saved_tokens >= target_savings;
+            match (candidate_meets_target, current_meets_target) {
+                (true, false) => true,
+                (false, true) => false,
+                (true, true) => {
+                    candidate.invalidated_suffix_tokens < current.invalidated_suffix_tokens
+                        || (candidate.invalidated_suffix_tokens
+                            == current.invalidated_suffix_tokens
+                            && candidate.indices.len() < current.indices.len())
+                }
+                (false, false) if plan.requires_break_even => {
+                    let candidate_gain = expected_saved_tokens
+                        .saturating_mul(policy.snip_horizon_rounds)
+                        .saturating_sub(candidate.invalidated_suffix_tokens);
+                    let current_gain = current
+                        .expected_saved_tokens
+                        .saturating_mul(policy.snip_horizon_rounds)
+                        .saturating_sub(current.invalidated_suffix_tokens);
+                    candidate_gain > current_gain
+                        || (candidate_gain == current_gain
+                            && expected_saved_tokens > current.expected_saved_tokens)
+                }
+                (false, false) => {
+                    expected_saved_tokens > current.expected_saved_tokens
+                        || (expected_saved_tokens == current.expected_saved_tokens
+                            && candidate.invalidated_suffix_tokens
+                                < current.invalidated_suffix_tokens)
+                }
+            }
+        });
+        if replace {
+            *best = Some(candidate);
+        }
+    }
+
+    fn local_compaction_tool_priority(message: &Message) -> Option<usize> {
+        let MessageContent::ToolResult { tool_name, .. } = &message.content else {
+            return None;
+        };
+        match tool_name.as_str() {
+            "Read" => Some(3),
+            "Bash" => Some(2),
+            "Grep" => Some(1),
+            _ => None,
+        }
+    }
+
+    fn local_compaction_message_tier(message: &Message) -> Option<ContextCompactionTier> {
+        let MessageContent::ToolResult {
+            result_for_assistant,
+            ..
+        } = &message.content
+        else {
+            return None;
+        };
+        result_for_assistant
+            .as_deref()
+            .and_then(Self::local_context_compaction_marker_tier)
     }
 
     fn local_compaction_protected_start(
@@ -693,12 +920,6 @@ impl ExecutionEngine {
         }
 
         let visible_chars = visible_text.chars().count();
-        if visible_chars < policy.min_tool_result_chars
-            && Self::local_context_compaction_marker_tier(&visible_text).is_none()
-        {
-            return false;
-        }
-
         let preview_chars = match tier {
             ContextCompactionTier::Snip => policy.snip_preview_chars,
             ContextCompactionTier::Prune => policy.prune_preview_chars,
@@ -3188,8 +3409,10 @@ impl ExecutionEngine {
                 let before_pressure = token_pressure;
                 let stats = Self::apply_local_context_compaction(
                     &mut messages,
-                    compaction_plan.tier,
+                    compaction_plan,
                     compaction_policy,
+                    token_pressure.total_tokens,
+                    token_pressure.input_limit,
                 );
 
                 if stats.has_changes() {
@@ -3218,13 +3441,6 @@ impl ExecutionEngine {
                     self.session_manager
                         .prune_token_anchors_to_messages(&context.session_id, &messages)
                         .await;
-                    self.session_manager
-                        .invalidate_prompt_cache(
-                            &context.session_id,
-                            crate::agentic::session::PromptCacheScope::All,
-                            "local_context_compaction_applied",
-                        )
-                        .await;
 
                     token_pressure = Self::estimate_auto_compression_pressure(
                         &messages,
@@ -3237,14 +3453,17 @@ impl ExecutionEngine {
 
                     let duration_ms = elapsed_ms_u64(local_start_time);
                     info!(
-                        "Local context compaction completed: session_id={}, turn_id={}, round_index={}, tier={}, changed_messages={}, snipped_tool_results={}, pruned_tool_results={}, protected_messages={}, total_tokens {} -> {}, estimated_message_tokens {} -> {}, input_limit={}, context_window={}, usage {:.3} -> {:.3}, duration_ms={}",
+                        "Local context compaction completed: session_id={}, turn_id={}, round_index={}, tier={}, eligible_candidates={}, changed_messages={}, snipped_tool_results={}, pruned_tool_results={}, expected_saved_tokens={}, invalidated_suffix_tokens={}, protected_messages={}, total_tokens {} -> {}, estimated_message_tokens {} -> {}, input_limit={}, context_window={}, usage {:.3} -> {:.3}, duration_ms={}",
                         context.session_id,
                         context.dialog_turn_id,
                         round_index,
                         compaction_plan.tier.as_str(),
+                        stats.eligible_candidates,
                         stats.changed_messages,
                         stats.snipped_tool_results,
                         stats.pruned_tool_results,
+                        stats.expected_saved_tokens,
+                        stats.invalidated_suffix_tokens,
                         stats.protected_messages,
                         before_pressure.total_tokens,
                         token_pressure.total_tokens,
@@ -3290,11 +3509,12 @@ impl ExecutionEngine {
                     .await;
                 } else {
                     debug!(
-                        "Local context compaction skipped: session_id={}, turn_id={}, round_index={}, tier={}, reason=no_eligible_messages, total_tokens={}, input_limit={}, context_window={}, protected_tail_tokens={}, protected_recent_user_turns={}",
+                        "Local context compaction skipped: session_id={}, turn_id={}, round_index={}, tier={}, reason=no_profitable_batch, eligible_candidates={}, total_tokens={}, input_limit={}, context_window={}, protected_tail_tokens={}, protected_recent_user_turns={}",
                         context.session_id,
                         context.dialog_turn_id,
                         round_index,
                         compaction_plan.tier.as_str(),
+                        stats.eligible_candidates,
                         token_pressure.total_tokens,
                         token_pressure.input_limit,
                         token_pressure.context_window,
@@ -3304,8 +3524,12 @@ impl ExecutionEngine {
                 }
             }
 
-            let should_compress = enable_context_compression
-                && token_pressure.total_tokens >= token_pressure.input_limit;
+            let should_compress = Self::should_run_full_context_compression(
+                enable_context_compression,
+                compaction_plan,
+                token_pressure.total_tokens,
+                token_pressure.input_limit,
+            );
 
             // Circuit breaker: skip full compression if it has failed too many
             // consecutive times.  Microcompact and emergency truncation still run.
@@ -4263,14 +4487,21 @@ impl ExecutionEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContextHealthSnapshot, ExecutionEngine, TurnPromptScaffold};
+    use super::{
+        ContextHealthSnapshot, ExecutionEngine, LocalContextCompactionCandidate, TurnPromptScaffold,
+    };
     use crate::agentic::agents::PrependedPromptReminders;
-    use crate::agentic::core::{InternalReminderKind, Message, MessageRole, ToolCall, ToolResult};
+    use crate::agentic::core::{
+        InternalReminderKind, Message, MessageContent, MessageRole, ToolCall, ToolResult,
+    };
     use crate::agentic::session::{TokenAnchor, TokenAnchorInput};
     use crate::agentic::tools::ToolRuntimeRestrictions;
     use crate::service::config::types::AIConfig;
     use crate::service::config::types::AIModelConfig;
     use crate::util::types::ToolDefinition;
+    use bitfun_agent_runtime::context_compaction::{
+        ContextCompactionPolicy, ContextCompactionTier,
+    };
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -4365,6 +4596,189 @@ mod tests {
         assert_eq!(budget.output_reserve_tokens, 16_000);
         assert_eq!(budget.safety_reserve_tokens, 10_000);
         assert_eq!(budget.input_limit, 102_000);
+    }
+
+    #[test]
+    fn summarize_watermark_triggers_full_compression_before_input_limit() {
+        let plan = ContextCompactionPolicy::default().plan(95, 100);
+
+        assert_eq!(plan.tier, ContextCompactionTier::Summarize);
+        assert!(ExecutionEngine::should_run_full_context_compression(
+            true, plan, 95, 100
+        ));
+        assert!(!ExecutionEngine::should_run_full_context_compression(
+            false, plan, 95, 100
+        ));
+    }
+
+    #[test]
+    fn snip_batch_requires_expected_savings_to_cover_suffix_rebuild() {
+        let policy = ContextCompactionPolicy::default();
+        let plan = policy.plan(60, 100);
+        let candidates = vec![LocalContextCompactionCandidate {
+            index: 1,
+            tool_priority: 3,
+            expected_saved_tokens: 300,
+            suffix_tokens: 2_000,
+        }];
+
+        assert!(ExecutionEngine::select_local_context_compaction_batch(
+            &candidates,
+            plan,
+            policy,
+            60,
+            100,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn snip_batch_respects_three_item_limit() {
+        let policy = ContextCompactionPolicy::default();
+        let plan = policy.plan(60, 100);
+        let candidates = (0..6)
+            .map(|offset| LocalContextCompactionCandidate {
+                index: offset + 1,
+                tool_priority: 3,
+                expected_saved_tokens: 600,
+                suffix_tokens: 3_600 - offset * 600,
+            })
+            .collect::<Vec<_>>();
+
+        let batch = ExecutionEngine::select_local_context_compaction_batch(
+            &candidates,
+            plan,
+            policy,
+            8_000,
+            10_000,
+        )
+        .expect("profitable snip batch");
+
+        assert_eq!(batch.indices.len(), 3);
+        assert_eq!(batch.expected_saved_tokens, 1_800);
+    }
+
+    #[test]
+    fn prune_batch_expands_until_forced_target_is_reached() {
+        let policy = ContextCompactionPolicy::default();
+        let plan = policy.plan(80, 100);
+        let candidates = (0..6)
+            .map(|offset| LocalContextCompactionCandidate {
+                index: offset + 1,
+                tool_priority: 3,
+                expected_saved_tokens: 700,
+                suffix_tokens: 4_200 - offset * 700,
+            })
+            .collect::<Vec<_>>();
+
+        let batch = ExecutionEngine::select_local_context_compaction_batch(
+            &candidates,
+            plan,
+            policy,
+            10_000,
+            10_000,
+        )
+        .expect("forced prune batch");
+
+        assert_eq!(batch.indices.len(), 4);
+        assert!(batch.expected_saved_tokens >= 2_800);
+    }
+
+    #[test]
+    fn prune_batch_uses_safety_cap_when_target_is_unreachable() {
+        let policy = ContextCompactionPolicy::default();
+        let plan = policy.plan(80, 100);
+        let candidates = (0..20)
+            .map(|offset| LocalContextCompactionCandidate {
+                index: offset + 1,
+                tool_priority: 3,
+                expected_saved_tokens: 100,
+                suffix_tokens: 4_000 - offset * 100,
+            })
+            .collect::<Vec<_>>();
+
+        let batch = ExecutionEngine::select_local_context_compaction_batch(
+            &candidates,
+            plan,
+            policy,
+            10_000,
+            10_000,
+        )
+        .expect("bounded forced prune batch");
+
+        assert_eq!(batch.indices.len(), policy.prune_max_items);
+        assert_eq!(batch.expected_saved_tokens, 1_200);
+    }
+
+    #[test]
+    fn local_compaction_changes_only_selected_assistant_view() {
+        let policy = ContextCompactionPolicy {
+            protected_tail_tokens: 1,
+            protected_recent_user_turns: 1,
+            min_expected_saved_tokens: 1,
+            snip_horizon_rounds: 10,
+            ..ContextCompactionPolicy::default()
+        };
+        let plan = policy.plan(60, 100);
+        let read_result = json!({ "content": "read raw result" });
+        let write_result = json!({ "content": "write raw result" });
+        let mut messages = vec![
+            Message::system("system".to_string()),
+            Message::tool_result(ToolResult {
+                tool_id: "read-1".to_string(),
+                tool_name: "Read".to_string(),
+                result: read_result.clone(),
+                result_for_assistant: Some("read output\n".repeat(800)),
+                is_error: false,
+                duration_ms: None,
+                image_attachments: None,
+            }),
+            Message::tool_result(ToolResult {
+                tool_id: "write-1".to_string(),
+                tool_name: "Write".to_string(),
+                result: write_result.clone(),
+                result_for_assistant: Some("write output\n".repeat(800)),
+                is_error: false,
+                duration_ms: None,
+                image_attachments: None,
+            }),
+            Message::user("continue".to_string()),
+        ];
+
+        let stats = ExecutionEngine::apply_local_context_compaction(
+            &mut messages,
+            plan,
+            policy,
+            8_000,
+            10_000,
+        );
+
+        assert_eq!(stats.changed_messages, 1);
+        let MessageContent::ToolResult {
+            result,
+            result_for_assistant,
+            ..
+        } = &messages[1].content
+        else {
+            panic!("expected Read tool result");
+        };
+        assert_eq!(result, &read_result);
+        assert!(result_for_assistant
+            .as_deref()
+            .is_some_and(|text| text.starts_with("<context-compaction>")));
+
+        let MessageContent::ToolResult {
+            result,
+            result_for_assistant,
+            ..
+        } = &messages[2].content
+        else {
+            panic!("expected Write tool result");
+        };
+        assert_eq!(result, &write_result);
+        assert!(result_for_assistant
+            .as_deref()
+            .is_some_and(|text| text.starts_with("write output")));
     }
 
     #[test]

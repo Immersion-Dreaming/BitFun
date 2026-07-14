@@ -40,11 +40,16 @@ pub struct ContextCompactionPolicy {
     pub snip_ratio: f32,
     pub prune_ratio: f32,
     pub summarize_ratio: f32,
+    pub snip_target_ratio: f32,
+    pub prune_target_ratio: f32,
     pub protected_tail_tokens: usize,
     pub protected_recent_user_turns: usize,
     pub snip_preview_chars: usize,
     pub prune_preview_chars: usize,
-    pub min_tool_result_chars: usize,
+    pub min_expected_saved_tokens: usize,
+    pub snip_max_items: usize,
+    pub prune_max_items: usize,
+    pub snip_horizon_rounds: usize,
 }
 
 impl Default for ContextCompactionPolicy {
@@ -53,11 +58,16 @@ impl Default for ContextCompactionPolicy {
             snip_ratio: 0.60,
             prune_ratio: 0.80,
             summarize_ratio: 0.95,
+            snip_target_ratio: 0.55,
+            prune_target_ratio: 0.72,
             protected_tail_tokens: 8_000,
             protected_recent_user_turns: 2,
             snip_preview_chars: 1_200,
             prune_preview_chars: 240,
-            min_tool_result_chars: 4_000,
+            min_expected_saved_tokens: 256,
+            snip_max_items: 3,
+            prune_max_items: 12,
+            snip_horizon_rounds: 3,
         }
     }
 }
@@ -66,6 +76,9 @@ impl Default for ContextCompactionPolicy {
 pub struct ContextCompactionPlan {
     pub tier: ContextCompactionTier,
     pub pressure_ratio: f32,
+    pub target_ratio: f32,
+    pub max_items: usize,
+    pub requires_break_even: bool,
 }
 
 impl ContextCompactionPolicy {
@@ -74,6 +87,9 @@ impl ContextCompactionPolicy {
             return ContextCompactionPlan {
                 tier: ContextCompactionTier::None,
                 pressure_ratio: 0.0,
+                target_ratio: 0.0,
+                max_items: 0,
+                requires_break_even: false,
             };
         }
 
@@ -88,9 +104,18 @@ impl ContextCompactionPolicy {
             ContextCompactionTier::None
         };
 
+        let (target_ratio, max_items, requires_break_even) = match tier {
+            ContextCompactionTier::Snip => (self.snip_target_ratio, self.snip_max_items, true),
+            ContextCompactionTier::Prune => (self.prune_target_ratio, self.prune_max_items, false),
+            _ => (0.0, 0, false),
+        };
+
         ContextCompactionPlan {
             tier,
             pressure_ratio,
+            target_ratio,
+            max_items,
+            requires_break_even,
         }
     }
 }
@@ -107,6 +132,12 @@ mod tests {
         assert_eq!(policy.plan(60, 100).tier, ContextCompactionTier::Snip);
         assert_eq!(policy.plan(80, 100).tier, ContextCompactionTier::Prune);
         assert_eq!(policy.plan(95, 100).tier, ContextCompactionTier::Summarize);
+        assert_eq!(policy.plan(60, 100).target_ratio, 0.55);
+        assert_eq!(policy.plan(60, 100).max_items, 3);
+        assert!(policy.plan(60, 100).requires_break_even);
+        assert_eq!(policy.plan(80, 100).target_ratio, 0.72);
+        assert_eq!(policy.plan(80, 100).max_items, 12);
+        assert!(!policy.plan(80, 100).requires_break_even);
     }
 
     #[test]

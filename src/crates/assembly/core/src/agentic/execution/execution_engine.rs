@@ -861,17 +861,30 @@ impl ExecutionEngine {
             }
         }
 
-        let mut user_turn_protected_start = messages.len();
-        let mut user_turns = 0usize;
-        for (index, message) in messages.iter().enumerate().rev() {
-            if message.is_actual_user_message() {
-                user_turns += 1;
-                user_turn_protected_start = index;
-                if user_turns >= policy.protected_recent_user_turns {
-                    break;
+        let user_turn_protected_start = if policy.protected_recent_user_turns == 0 {
+            messages.len()
+        } else {
+            let mut user_turns = 0usize;
+            let mut protected_start = None;
+            for (index, message) in messages.iter().enumerate().rev() {
+                if message.is_actual_user_message() {
+                    user_turns += 1;
+                    protected_start = Some(index);
+                    if user_turns >= policy.protected_recent_user_turns {
+                        break;
+                    }
                 }
             }
-        }
+
+            // A single-turn task has no meaningful user-turn boundary for
+            // protecting the whole transcript. Fall back to the token tail
+            // until enough actual user turns exist to establish the boundary.
+            if user_turns >= policy.protected_recent_user_turns {
+                protected_start.unwrap_or(messages.len())
+            } else {
+                messages.len()
+            }
+        };
 
         token_protected_start.min(user_turn_protected_start)
     }
@@ -4708,6 +4721,73 @@ mod tests {
 
         assert_eq!(batch.indices.len(), policy.prune_max_items);
         assert_eq!(batch.expected_saved_tokens, 1_200);
+    }
+
+    #[test]
+    fn single_user_turn_does_not_protect_the_entire_transcript() {
+        let policy = ContextCompactionPolicy {
+            protected_tail_tokens: 1,
+            protected_recent_user_turns: 2,
+            ..ContextCompactionPolicy::default()
+        };
+        let messages = vec![
+            Message::system("system".to_string()),
+            Message::user("initial request".to_string()),
+            Message::tool_result(ToolResult {
+                tool_id: "read-1".to_string(),
+                tool_name: "Read".to_string(),
+                result: json!({"content": "old result"}),
+                result_for_assistant: Some("old result".to_string()),
+                is_error: false,
+                duration_ms: None,
+                image_attachments: None,
+            }),
+            Message::tool_result(ToolResult {
+                tool_id: "read-2".to_string(),
+                tool_name: "Read".to_string(),
+                result: json!({"content": "recent result"}),
+                result_for_assistant: Some("recent result".to_string()),
+                is_error: false,
+                duration_ms: None,
+                image_attachments: None,
+            }),
+        ];
+
+        assert_eq!(ExecutionEngine::local_compaction_protected_start(&messages, policy), 3);
+    }
+
+    #[test]
+    fn recent_user_turn_boundary_is_used_when_enough_turns_exist() {
+        let policy = ContextCompactionPolicy {
+            protected_tail_tokens: 1,
+            protected_recent_user_turns: 2,
+            ..ContextCompactionPolicy::default()
+        };
+        let messages = vec![
+            Message::system("system".to_string()),
+            Message::user("first request".to_string()),
+            Message::tool_result(ToolResult {
+                tool_id: "read-1".to_string(),
+                tool_name: "Read".to_string(),
+                result: json!({"content": "first result"}),
+                result_for_assistant: Some("first result".to_string()),
+                is_error: false,
+                duration_ms: None,
+                image_attachments: None,
+            }),
+            Message::user("second request".to_string()),
+            Message::tool_result(ToolResult {
+                tool_id: "read-2".to_string(),
+                tool_name: "Read".to_string(),
+                result: json!({"content": "second result"}),
+                result_for_assistant: Some("second result".to_string()),
+                is_error: false,
+                duration_ms: None,
+                image_attachments: None,
+            }),
+        ];
+
+        assert_eq!(ExecutionEngine::local_compaction_protected_start(&messages, policy), 1);
     }
 
     #[test]

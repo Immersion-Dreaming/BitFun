@@ -5,6 +5,7 @@
 use super::model_exchange_trace::{
     prepare_model_exchange_trace_for_workspace, ModelExchangeTraceOperation,
 };
+use super::observation_dedup::TurnObservationDeduplicator;
 use super::round_executor::RoundExecutor;
 use super::types::{ExecutionContext, ExecutionResult, RoundContext, RoundResult};
 use crate::agentic::agents::{
@@ -2748,6 +2749,10 @@ impl ExecutionEngine {
         let mut full_compression_count = 0usize;
         let mut compression_failure_count = 0u32;
 
+        // Tracks content-identical tool results within this turn to avoid
+        // storing duplicate observations in the context window.
+        let mut observation_deduplicator = TurnObservationDeduplicator::new();
+
         // Save the last token usage statistics
         let mut last_usage: Option<crate::util::types::ai::GeminiUsage> = None;
 
@@ -3000,6 +3005,10 @@ impl ExecutionEngine {
                         full_compression_count += 1;
                         consecutive_compression_failures = 0;
                         send_pressure_reusable = false;
+                        // Message indices recorded by the deduplicator no longer
+                        // correspond to the post-compression slice; reset so
+                        // future observations are treated as first-occurrences.
+                        observation_deduplicator.reset_after_compression();
                     }
                     Ok(None) => {
                         debug!("No eligible multi-turn context available for compression");
@@ -3206,14 +3215,20 @@ impl ExecutionEngine {
                 warn!("Failed to update assistant message in memory: {}", e);
             }
 
-            // Add tool result messages to history
+            // Add tool result messages to history, deduplicating observations
+            // whose content is identical to a result already stored this turn.
             for tool_result_msg in round_result.tool_result_messages.iter() {
-                messages.push(tool_result_msg.clone());
+                let msg_to_store = observation_deduplicator.apply(
+                    tool_result_msg,
+                    messages.len(),
+                    round_index,
+                );
+                messages.push(msg_to_store.clone());
 
                 // Update the in-memory message caches immediately so subsequent rounds see it.
                 if let Err(e) = self
                     .session_manager
-                    .add_message(&context.session_id, tool_result_msg.clone())
+                    .add_message(&context.session_id, msg_to_store)
                     .await
                 {
                     warn!("Failed to update tool result message in memory: {}", e);

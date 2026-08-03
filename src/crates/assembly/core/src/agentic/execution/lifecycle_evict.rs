@@ -223,11 +223,25 @@ impl LifecycleEvictionManager {
         vi_json: String,
     ) -> BitFunResult<std::collections::HashMap<usize, SegmentState>> {
         use crate::infrastructure::ai::get_global_ai_client_factory;
+        use crate::service::config::get_global_config_service;
 
         let factory = get_global_ai_client_factory().await.map_err(|e| {
             BitFunError::AIClient(format!("lifecycle estimator factory: {e}"))
         })?;
-        let client = factory.get_client_resolved(ESTIMATOR_MODEL).await.map_err(|e| {
+
+        // Resolve the estimator model via the BitFun "fast" config slot so the
+        // user can configure it from the normal model settings UI.  Fall back to
+        // the hardcoded Haiku constant when no config is present.
+        let model_id: String = async {
+            let service = get_global_config_service().await.ok()?;
+            let ai_config: crate::service::config::types::AIConfig =
+                service.get_config(Some("ai")).await.ok()?;
+            ai_config.resolve_model_selection("fast")
+        }
+        .await
+        .unwrap_or_else(|| ESTIMATOR_MODEL.to_string());
+
+        let client = factory.get_client_resolved(&model_id).await.map_err(|e| {
             BitFunError::AIClient(format!("lifecycle estimator client: {e}"))
         })?;
 

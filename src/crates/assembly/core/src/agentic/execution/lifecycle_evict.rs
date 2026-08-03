@@ -17,8 +17,6 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const LIFECYCLE_BATCH_SIZE: usize = 3;
 
-const ESTIMATOR_MODEL: &str = "claude-haiku-4-5-20251001";
-
 /// Char limit for regular (non-persisted) tool result previews in Vi.
 const RESULT_PREVIEW_CHARS: usize = 600;
 
@@ -223,25 +221,13 @@ impl LifecycleEvictionManager {
         vi_json: String,
     ) -> BitFunResult<std::collections::HashMap<usize, SegmentState>> {
         use crate::infrastructure::ai::get_global_ai_client_factory;
-        use crate::service::config::get_global_config_service;
 
         let factory = get_global_ai_client_factory().await.map_err(|e| {
             BitFunError::AIClient(format!("lifecycle estimator factory: {e}"))
         })?;
 
-        // Resolve the estimator model via the BitFun "fast" config slot so the
-        // user can configure it from the normal model settings UI.  Fall back to
-        // the hardcoded Haiku constant when no config is present.
-        let model_id: String = async {
-            let service = get_global_config_service().await.ok()?;
-            let ai_config: crate::service::config::types::AIConfig =
-                service.get_config(Some("ai")).await.ok()?;
-            ai_config.resolve_model_selection("fast")
-        }
-        .await
-        .unwrap_or_else(|| ESTIMATOR_MODEL.to_string());
-
-        let client = factory.get_client_resolved(&model_id).await.map_err(|e| {
+        // get_client_resolved handles "fast" → primary fallback internally.
+        let client = factory.get_client_resolved("fast").await.map_err(|e| {
             BitFunError::AIClient(format!("lifecycle estimator client: {e}"))
         })?;
 

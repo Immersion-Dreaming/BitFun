@@ -160,6 +160,11 @@ pub struct SessionConfig {
     /// Model config ID used by this session (for token usage tracking)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// Override for lifecycle-eviction batch size (number of rounds between
+    /// estimator calls).  Defaults to `lifecycle_evict::LIFECYCLE_BATCH_SIZE`
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_eviction_batch_size: Option<usize>,
 }
 
 impl Default for SessionConfig {
@@ -176,6 +181,7 @@ impl Default for SessionConfig {
             remote_connection_id: None,
             remote_ssh_host: None,
             model_id: None,
+            lifecycle_eviction_batch_size: None,
         }
     }
 }

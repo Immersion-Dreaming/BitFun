@@ -2,6 +2,7 @@
 //!
 //! Responsible for AI interaction and model round control
 
+pub(crate) mod lifecycle_evict;
 pub mod execution_engine;
 pub(crate) mod model_exchange_trace;
 pub mod round_executor;

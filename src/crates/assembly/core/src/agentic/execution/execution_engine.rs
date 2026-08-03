@@ -2756,6 +2756,43 @@ impl ExecutionEngine {
         let mut thinking_only_rescue_attempts: usize = 0;
         let mut partial_continuation_attempts: usize = 0;
 
+        // ── Lifecycle-Aware Eviction (Hook 1) ────────────────────────────────
+        // Initialise the manager and extract the task context once before the
+        // round loop starts.  Both are reused across all rounds in this turn.
+        let lifecycle_batch_size = session
+            .config
+            .lifecycle_eviction_batch_size
+            .unwrap_or(super::lifecycle_evict::LIFECYCLE_BATCH_SIZE);
+        let mut lifecycle_eviction_manager =
+            super::lifecycle_evict::LifecycleEvictionManager::new(lifecycle_batch_size);
+
+        // First ActualUserInput in the message list; fall back to the last user
+        // message so the context string is never empty.
+        let lifecycle_task_context: String = messages
+            .iter()
+            .find(|m| {
+                matches!(
+                    m.metadata.semantic_kind,
+                    Some(crate::agentic::core::MessageSemanticKind::ActualUserInput)
+                )
+            })
+            .or_else(|| messages.iter().rev().find(|m| m.role == crate::agentic::core::MessageRole::User))
+            .map(|m| match &m.content {
+                crate::agentic::core::MessageContent::Text(t) =>
+                    super::lifecycle_evict::truncate_chars(t, 500),
+                crate::agentic::core::MessageContent::Multimodal { text, .. } =>
+                    super::lifecycle_evict::truncate_chars(text, 500),
+                _ => String::new(),
+            })
+            .unwrap_or_default();
+
+        // Recovery files land next to regular tool-result persisted outputs.
+        let lifecycle_tool_results_dir: Option<std::path::PathBuf> = context
+            .workspace
+            .as_ref()
+            .map(|ws| ws.session_storage_dir().join(&context.session_id).join("tool-results"));
+        // ─────────────────────────────────────────────────────────────────────
+
         // Add detailed logging showing the execution context messages.
         debug!(
             "Executing dialog turn: dialog_turn_id={}, mode={}, agent={}, initial_messages={}, messages_len={}",
@@ -3000,6 +3037,9 @@ impl ExecutionEngine {
                         full_compression_count += 1;
                         consecutive_compression_failures = 0;
                         send_pressure_reusable = false;
+                        // ── Hook 4: full compression replaced messages; all stored
+                        // segment indices are stale — reset the lifecycle registry.
+                        lifecycle_eviction_manager.reset_after_compression();
                     }
                     Ok(None) => {
                         debug!("No eligible multi-turn context available for compression");
@@ -3054,6 +3094,9 @@ impl ExecutionEngine {
                 self.session_manager
                     .prune_token_anchors_to_messages(&context.session_id, &messages)
                     .await;
+                // ── Hook 5: emergency truncation physically deleted messages;
+                // stored segment indices are stale — reset just like Hook 4.
+                lifecycle_eviction_manager.reset_after_compression();
                 send_pressure = Self::estimate_auto_compression_pressure(
                     &messages,
                     tool_definitions.as_deref(),
@@ -3196,6 +3239,8 @@ impl ExecutionEngine {
 
             // Add assistant message to history
             messages.push(round_result.assistant_message.clone());
+            // ── Hook 2a: capture assistant message index immediately after push ──
+            let lifecycle_assistant_msg_idx = messages.len() - 1;
 
             // Update the in-memory message caches immediately so subsequent rounds see it.
             if let Err(e) = self
@@ -3220,11 +3265,52 @@ impl ExecutionEngine {
                 }
             }
 
+            // ── Hook 2b: record segment after all tool results are pushed ────────
+            lifecycle_eviction_manager.record_segment(
+                &messages,
+                round_index,
+                lifecycle_assistant_msg_idx,
+            );
+
             debug!(
                 "Updated round messages in memory: round_index={}, assistant + {} tool results",
                 round_index,
                 round_result.tool_result_messages.len()
             );
+
+            // ── Hook 3: batch eviction at every B-th round ───────────────────────
+            if lifecycle_eviction_manager.should_run_estimator(round_index) {
+                let evicted = lifecycle_eviction_manager
+                    .run_batch_eviction(
+                        &mut messages,
+                        round_index,
+                        &lifecycle_task_context,
+                        lifecycle_tool_results_dir.as_deref(),
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        warn!("lifecycle eviction error (skipping): {}", e);
+                        0
+                    });
+
+                if evicted > 0 {
+                    self.session_manager
+                        .replace_context_messages(&context.session_id, messages.clone())
+                        .await;
+                    self.session_manager
+                        .invalidate_prompt_cache(
+                            &context.session_id,
+                            crate::agentic::session::PromptCacheScope::All,
+                            "lifecycle_eviction_applied",
+                        )
+                        .await;
+                    debug!(
+                        "Lifecycle eviction sync: session={}, evicted={}, messages_len={}",
+                        context.session_id, evicted, messages.len()
+                    );
+                }
+            }
+            // ─────────────────────────────────────────────────────────────────────
 
             total_tools += round_result.tool_calls.len();
 

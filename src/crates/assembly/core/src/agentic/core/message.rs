@@ -108,6 +108,7 @@ pub enum InternalReminderKind {
     InterruptedContinue,
     ThinkingOnlyRescue,
     FinalizeCacheAnchor,
+    LifecycleEvictionSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +139,7 @@ impl InternalReminderKind {
                 | Self::InterruptedContinue
                 | Self::ThinkingOnlyRescue
                 | Self::FinalizeCacheAnchor
+                | Self::LifecycleEvictionSummary
         )
     }
 

@@ -4,7 +4,7 @@
 //! deltas and exposes only conservatively validated candidates. This module
 //! never rewrites message history or invalidates the provider prompt cache.
 
-use crate::agentic::core::message::{Message, MessageContent, ToolCall};
+use crate::agentic::core::message::{InternalReminderKind, Message, MessageContent, ToolCall};
 use crate::util::errors::{BitFunError, BitFunResult};
 use crate::util::types::Message as AIMessage;
 use log::warn;
@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub(crate) const LIFECYCLE_REGISTRY_METADATA_KEY: &str = "lifecycleEvictionRegistry";
+/// Fixed during the first end-to-end rollout so CLI users need no session flag.
+pub(crate) const LIFECYCLE_BATCH_SIZE: usize = 3;
 pub(crate) const RECENT_SEGMENTS_TO_PROTECT: usize = 2;
 const INTENT_PREVIEW_CHARS: usize = 800;
 
@@ -41,6 +43,8 @@ pub(crate) struct LifecycleTask {
     #[serde(default)]
     pub(crate) segment_ids: Vec<String>,
     pub(crate) last_touched_turn_seq: usize,
+    #[serde(default)]
+    pub(crate) evicted: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -115,6 +119,7 @@ impl LifecycleRegistry {
                 unresolved_questions: vec![],
                 segment_ids: vec![],
                 last_touched_turn_seq: turn_seq,
+                evicted: false,
             });
         task_id
     }
@@ -301,6 +306,7 @@ impl LifecycleRegistry {
             .filter(|task| {
                 task.id != current_task_id
                     && task.state == LifecycleTaskState::Evictable
+                    && !task.evicted
                     && !task.completion_evidence.is_empty()
                     && task.unresolved_questions.is_empty()
                     && !self.task_has_protected_segment(&task.id, current_turn_seq)
@@ -376,6 +382,150 @@ impl LifecycleRegistry {
                 || !task.segment_ids.is_empty()
         });
     }
+
+    pub(crate) fn mark_tasks_evicted(&mut self, task_ids: &[String]) {
+        for task_id in task_ids {
+            if let Some(task) = self.tasks.get_mut(task_id) {
+                task.evicted = true;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LifecycleEvictionPlan {
+    pub(crate) task_ids: Vec<String>,
+    pub(crate) artifact_handles: Vec<String>,
+    replacements: Vec<LifecycleReplacement>,
+}
+
+#[derive(Debug, Clone)]
+struct LifecycleReplacement {
+    start: usize,
+    end: usize,
+    turn_id: String,
+    task_id: String,
+    artifact_handles: Vec<String>,
+}
+
+impl LifecycleEvictionPlan {
+    /// Apply to a clone only after all target ranges and artifacts were verified.
+    pub(crate) fn apply(&self, messages: &[Message]) -> BitFunResult<Vec<Message>> {
+        let mut rewritten = messages.to_vec();
+        let mut replacements = self.replacements.clone();
+        replacements.sort_by(|left, right| right.start.cmp(&left.start));
+        for replacement in replacements {
+            if replacement.end > rewritten.len() || replacement.start >= replacement.end {
+                return Err(BitFunError::tool(
+                    "lifecycle eviction plan range became invalid",
+                ));
+            }
+            let summary = format!(
+                "[LIFECYCLE_EVICTION task_id={}]\nCompleted task output was evicted from context.\nArtifacts:\n{}",
+                replacement.task_id,
+                replacement.artifact_handles.join("\n"),
+            );
+            let reminder =
+                Message::internal_reminder(InternalReminderKind::LifecycleEvictionSummary, summary)
+                    .with_turn_id(replacement.turn_id);
+            rewritten.splice(replacement.start..replacement.end, [reminder]);
+        }
+        Ok(rewritten)
+    }
+}
+
+pub(crate) fn build_eviction_plan(
+    registry: &LifecycleRegistry,
+    messages: &[Message],
+    task_ids: &[String],
+) -> BitFunResult<LifecycleEvictionPlan> {
+    let mut replacements = Vec::new();
+    let mut artifact_handles = Vec::new();
+    for task_id in task_ids {
+        let Some(task) = registry.tasks.get(task_id) else {
+            return Err(BitFunError::tool(format!(
+                "lifecycle candidate task disappeared: {task_id}"
+            )));
+        };
+        if task.evicted || task.state != LifecycleTaskState::Evictable {
+            return Err(BitFunError::tool(format!(
+                "lifecycle task is no longer evictable: {task_id}"
+            )));
+        }
+        for segment_id in &task.segment_ids {
+            let Some(segment) = registry.segments.get(segment_id) else {
+                return Err(BitFunError::tool(format!(
+                    "lifecycle segment disappeared: {segment_id}"
+                )));
+            };
+            if segment.artifact_handles.is_empty() {
+                return Err(BitFunError::tool(format!(
+                    "lifecycle segment lacks artifact: {segment_id}"
+                )));
+            }
+            let (start, end) = locate_segment(messages, segment)?;
+            artifact_handles.extend(segment.artifact_handles.clone());
+            replacements.push(LifecycleReplacement {
+                start,
+                end,
+                turn_id: segment.turn_id.clone(),
+                task_id: task_id.clone(),
+                artifact_handles: segment.artifact_handles.clone(),
+            });
+        }
+    }
+    replacements.sort_by_key(|replacement| replacement.start);
+    if replacements
+        .windows(2)
+        .any(|pair| pair[0].end > pair[1].start)
+    {
+        return Err(BitFunError::tool("lifecycle eviction targets overlap"));
+    }
+    if replacements.is_empty() {
+        return Err(BitFunError::tool(
+            "lifecycle eviction has no segments to replace",
+        ));
+    }
+    Ok(LifecycleEvictionPlan {
+        task_ids: task_ids.to_vec(),
+        artifact_handles,
+        replacements,
+    })
+}
+
+fn locate_segment(
+    messages: &[Message],
+    segment: &LifecycleSegment,
+) -> BitFunResult<(usize, usize)> {
+    let start = messages
+        .iter()
+        .position(|message| {
+            message.metadata.turn_id.as_deref() == Some(segment.turn_id.as_str())
+                && matches!(&message.content, MessageContent::Mixed { tool_calls, .. }
+                if tool_calls.iter().map(|call| &call.tool_id).eq(segment.tool_call_ids.iter()))
+        })
+        .ok_or_else(|| {
+            BitFunError::tool(format!(
+                "lifecycle segment cannot be relocated: {}",
+                segment.id
+            ))
+        })?;
+    let mut end = start + 1;
+    let mut result_ids = Vec::new();
+    while let Some(message) = messages.get(end) {
+        let MessageContent::ToolResult { tool_id, .. } = &message.content else {
+            break;
+        };
+        result_ids.push(tool_id.clone());
+        end += 1;
+    }
+    if result_ids != segment.tool_call_ids {
+        return Err(BitFunError::tool(format!(
+            "lifecycle segment result IDs changed: {}",
+            segment.id
+        )));
+    }
+    Ok((start, end))
 }
 
 pub(crate) async fn estimate_registry_delta(vi_json: String) -> BitFunResult<String> {
@@ -411,7 +561,10 @@ fn artifact_handle_from_message(message: &Message) -> Option<String> {
         return None;
     };
     text.lines()
-        .find_map(|line| line.strip_prefix("Full output saved to: "))
+        .find_map(|line| {
+            line.strip_prefix("Full output saved to: ")
+                .or_else(|| line.strip_prefix("Full output was saved to: "))
+        })
         .map(str::to_string)
 }
 
@@ -604,5 +757,44 @@ mod tests {
         r.record_segment(&messages("one", true, false, false), 0, 2, "one", 0, &task);
         assert!(r.should_estimate(2, 3));
         assert!(!r.should_estimate(1, 3));
+    }
+
+    #[test]
+    fn plan_relocates_by_stable_ids_and_replaces_only_the_target_range() {
+        let mut registry = LifecycleRegistry::default();
+        let task = registry.begin_turn("turn-1", 0, "inspect".into());
+        let messages = messages("turn-1", true, false, false)
+            .into_iter()
+            .map(|message| message.with_turn_id("turn-1".to_string()))
+            .collect::<Vec<_>>();
+        registry.record_segment(&messages, 0, 2, "turn-1", 0, &task);
+        let record = registry.tasks.get_mut(&task).unwrap();
+        record.state = LifecycleTaskState::Evictable;
+        record.completion_evidence.push("done".into());
+
+        let plan = build_eviction_plan(&registry, &messages, &[task.clone()]).unwrap();
+        let rewritten = plan.apply(&messages).unwrap();
+        assert_eq!(rewritten.len(), 1);
+        assert!(matches!(
+            rewritten[0].metadata.internal_reminder_kind,
+            Some(InternalReminderKind::LifecycleEvictionSummary)
+        ));
+        assert_eq!(rewritten[0].metadata.turn_id.as_deref(), Some("turn-1"));
+    }
+
+    #[test]
+    fn plan_rejects_changed_tool_result_ids_without_rewriting() {
+        let mut registry = LifecycleRegistry::default();
+        let task = registry.begin_turn("turn-1", 0, "inspect".into());
+        let mut messages = messages("turn-1", true, false, false)
+            .into_iter()
+            .map(|message| message.with_turn_id("turn-1".to_string()))
+            .collect::<Vec<_>>();
+        registry.record_segment(&messages, 0, 2, "turn-1", 0, &task);
+        registry.tasks.get_mut(&task).unwrap().state = LifecycleTaskState::Evictable;
+        if let MessageContent::ToolResult { tool_id, .. } = &mut messages[1].content {
+            *tool_id = "changed".into();
+        }
+        assert!(build_eviction_plan(&registry, &messages, &[task]).is_err());
     }
 }

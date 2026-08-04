@@ -8,7 +8,7 @@
 | 2 | 新建 `lifecycle_evict.rs` | 🟡 原型完成 | 代码存在，但仍是单 dialog-turn 的 segment 管理器，不满足论文的跨 session lifecycle 语义；见 Section 九 |
 | 3 | `execution/mod.rs` +1行 mod 声明 | ✅ 完成 | Section 四 |
 | 4 | `execution_engine.rs` Hook 1-5 | 🟡 原型接线完成 | 物理驱逐已接入，但当前不具备生产启用条件；见 Section 九 |
-| 5 | `SessionConfig` 新增 `lifecycle_eviction_batch_size` | 🟡 完成但缺少校验 | `Some(0)` 会在取模时 panic；见 Section 九 |
+| 5 | lifecycle batch 配置 | ✅ 固定为 3 user turns | 首轮端到端测试不暴露 CLI/session 参数，避免默认关闭或 `0` 配置 |
 | 6 | 构建验证 | ✅ `cargo test -p bitfun-core lifecycle_evict --lib` 通过 | 7 个模块单测通过；未确认整个 workspace `cargo test lifecycle` 的 11/11 声明 |
 | 7 | lifecycle 集成/回归测试 | ❌ 未完成 | 缺跨 turn、恢复失败、cache 成本、任务质量的自动化验证 |
 
@@ -25,7 +25,7 @@
 > 6. `Message::internal_reminder` 创建的是 **user-role**，不是 system-role，无API格式问题
 > 7. `bitfun_agent_tools` 已是 assembly/core 的依赖（Cargo.toml:89），无需额外引入
 > 8. `lifecycle_task_context` 提取加了 user-role fallback
-> 9. `batch_size` 改为从 `session.config.lifecycle_eviction_batch_size` 读取（默认3）
+> 9. 历史原型曾从 `session.config.lifecycle_eviction_batch_size` 读取；当前 Step 3 固定为 3 个 user turns。
 
 ## 一、message.rs（2处，共3行新增）
 
@@ -1133,9 +1133,9 @@ session task registry (persistent)
 | L2 | 单位是 `round_index`，不是任务；Vi 只有当前任务字符串和局部 tool preview | 无法表示“同一任务跨多 turn”、新用户请求切换任务、完成证据、未决问题与跨任务残余依赖。a02e22 的计划/探索 Read 段被删正是此缺口 | 已引入 `TaskRecord`/`SegmentRecord`；delta 带 `baseVersion`，并校验 task/turn ID、证据、单调状态及 `completed -> evictable` 前驱 | P0，Step 1-2 已完成 |
 | L3 | 近期轮、当前任务、Todo、planning intent 只在 prompt 中软约束；代码只硬拦 error | estimator 已在 a26c32 多次把 error 判为可删；同样会删除尚在执行的 Read/计划段，导致忘记待改文件和重复读 | 已实现确定性 candidate gate：当前任务、最近 N、error、pending Todo、无 artifact 及未完成证据者均不产生候选 | P0，Step 2 已完成 |
 | L4 | `lifecycle_task_context` 正向找第一条 `ActualUserInput` | 多 turn session 中它往往是最早任务，estimator 使用过期目标判断当前段 | 已用 `dialog_turn_id` 找本 turn user input；缺 metadata 才回退到最后 user message | P0，已完成 |
-| L5 | recovery JSON 写 `result_for_assistant`，写失败仍继续 drain | 已 persisted 的大结果此字段只是 preview/引用；失败时 summary 仍删除消息，所谓“Full content”并不可靠 | 使用已有 immutable artifact handle；未持久化结果先原子保存完整 payload。无可验证 handle 或落盘失败则本批不驱逐 | P0，未开始 |
+| L5 | recovery JSON 写 `result_for_assistant`，写失败仍继续 drain | 已 persisted 的大结果此字段只是 preview/引用；失败时 summary 仍删除消息，所谓“Full content”并不可靠 | Step 3 只接受已有 artifact handle；按当前 workspace/session 的 `tool-results` 实体文件校验。任一缺失、非文件、重定位失败或范围重叠均整批不驱逐 | P0，已完成 |
 | L6 | 任一 eviction 都 `replace_context_messages` + `PromptCacheScope::All`，还清空 file-read state | 一次中段改写会重建 provider cache；8.4 已证明频繁驱逐可能成本更高、重复读更多。API 无法保留任意中段删除后的后缀 KV | 驱逐前使用 provider usage 和 token estimate 计算收益；仅在接近压缩压力且预期后续复用足以回本时执行；一次 batch 最多一次重写 | P1，未开始 |
-| L7 | `lifecycle_eviction_batch_size: Option<usize>` 未限制，`% batch_size` 直接执行 | 恢复的 session/config 传入 0 会 panic | 配置解析和 `LifecycleEvictionManager::new` 双重拒绝/钳制 0；补回归测试 | P0，未开始 |
+| L7 | 可配置 batch 的 `0` 值会导致取模 panic | 端到端首次验证不应受隐藏 session 配置影响 | 已移除该配置字段，编译期固定 `LIFECYCLE_BATCH_SIZE=3`；仍保留零值单测 | P0，已完成 |
 | L8 | Vi、reasoning、raw estimator response 仅 debug 日志；当前测试只测内存重排 | 无法回放错误驱逐，无法量化误判、恢复和 cache 代价；7 个单测不覆盖实际风险 | 将每 batch 的输入摘要、delta、硬护栏拒绝原因、token 账目写可审计 session artifact；增加集成测试矩阵 | P1，未开始 |
 
 ### 9.3 目标数据模型：仅为 lifecycle 层新增 session 状态
@@ -1247,10 +1247,11 @@ shadow mode 做同一模型/同一任务/多次运行的对照；不以单次 to
 | Step 0 | ✅ 已完成 | 默认关闭；`batch_size=0` 禁用且不会除零；没有物理改写路径 |
 | Step 1 shadow registry | ✅ 已完成 | session metadata 持久化，跨 turn task/segment registry，batch 按 user turn |
 | Step 2 candidate gate | ✅ 已完成 | 版本、ownership、证据、状态前驱、当前/近期/error/Todo/artifact 均由程序硬校验 |
-| Step 3 physical eviction | ❌ 未实施 | 用其替代当前直接 drain 路径 |
+| Step 3 physical eviction | ✅ 已完成 | 按稳定 turn/tool-call ID 重新定位，artifact 文件验证后一次性替换；任一失败不改 context |
 | Step 4 economy gate | ❌ 未实施 | 以 telemetry 决定是否真正启用 |
 
 **Step 1-2 验证（2026-08-04）**：`cargo test -p bitfun-core lifecycle_evict --lib -- --nocapture`
-通过 6/6。覆盖 batch=0、跨 turn task 合并、过期版本、无完成证据、禁止
+通过 8/8。覆盖 batch=0、跨 turn task 合并、过期版本、无完成证据、禁止
 `active -> evictable` 直跳、单轮 result 边界，以及 current/recent/error/pending Todo/
-缺 artifact 的候选拒绝。尚未实现 Step 3，故此验证不包含消息物理删除或 artifact 恢复。
+缺 artifact 的候选拒绝；另覆盖稳定 ID 重定位的精确替换及 result ID 变化时拒绝。Step 3
+会在 `tool-results/lifecycle-eviction-<turn-id>.json` 写 estimator 输入/输出、候选、拒绝原因或删除结果。

@@ -2760,7 +2760,6 @@ impl ExecutionEngine {
         // ── Lifecycle-Aware Eviction (shadow mode, Steps 1-2) ───────────────
         // Step 3 rollout uses a fixed batch size so the shipped CLI exercises
         // the feature without requiring a hidden SessionConfig field.
-        let lifecycle_batch_size = super::lifecycle_evict::LIFECYCLE_BATCH_SIZE;
         let mut lifecycle_registry = {
             match self
                 .session_manager
@@ -2790,40 +2789,6 @@ impl ExecutionEngine {
             }
         };
 
-        // Use this dialog turn's user message. Looking up the first historical
-        // ActualUserInput made the old estimator reason about stale objectives.
-        let lifecycle_task_context: String = messages
-            .iter()
-            .rev()
-            .find(|m| {
-                matches!(
-                    m.metadata.semantic_kind,
-                    Some(crate::agentic::core::MessageSemanticKind::ActualUserInput)
-                ) && m.metadata.turn_id.as_deref() == Some(context.dialog_turn_id.as_str())
-            })
-            .or_else(|| {
-                messages
-                    .iter()
-                    .rev()
-                    .find(|m| m.role == crate::agentic::core::MessageRole::User)
-            })
-            .map(|m| match &m.content {
-                crate::agentic::core::MessageContent::Text(t) => {
-                    super::lifecycle_evict::truncate_chars(t, 500)
-                }
-                crate::agentic::core::MessageContent::Multimodal { text, .. } => {
-                    super::lifecycle_evict::truncate_chars(text, 500)
-                }
-                _ => String::new(),
-            })
-            .unwrap_or_default();
-        let lifecycle_task_id = lifecycle_registry.as_mut().map(|registry| {
-            registry.begin_turn(
-                &context.dialog_turn_id,
-                context.turn_index,
-                lifecycle_task_context.clone(),
-            )
-        });
         // ─────────────────────────────────────────────────────────────────────
 
         // Add detailed logging showing the execution context messages.
@@ -3295,18 +3260,19 @@ impl ExecutionEngine {
                 }
             }
 
-            // Record the completed tool round into the persistent shadow registry.
-            if let (Some(registry), Some(task_id)) =
-                (lifecycle_registry.as_mut(), lifecycle_task_id.as_deref())
-            {
+            // A lifecycle tick is a completed assistant + tool-result round.
+            if let Some(registry) = lifecycle_registry.as_mut() {
                 registry.record_segment(
                     &messages,
                     lifecycle_assistant_msg_idx,
                     messages.len(),
                     &context.dialog_turn_id,
-                    context.turn_index,
-                    task_id,
                 );
+                if registry.should_estimate() {
+                    lifecycle_eviction_applied |= self
+                        .run_lifecycle_batch(registry, &mut messages, &context)
+                        .await;
+                }
             }
 
             debug!(
@@ -3889,133 +3855,9 @@ impl ExecutionEngine {
             warn!("Dialog turn completed but token stats not available");
         }
 
-        // Estimator proposes lifecycle transitions after each fixed-size batch.
-        // Step 3 executes only candidates that pass artifact and relocation checks.
-        if let (Some(registry), Some(task_id)) =
-            (lifecycle_registry.as_mut(), lifecycle_task_id.as_deref())
-        {
-            let mut estimator_input: Option<String> = None;
-            let mut estimator_response: Option<String> = None;
-            if registry.should_estimate(context.turn_index, lifecycle_batch_size) {
-                match registry.build_vi(task_id, &context.dialog_turn_id, context.turn_index) {
-                    Ok(vi_json) => {
-                        estimator_input = Some(vi_json.clone());
-                        match super::lifecycle_evict::estimate_registry_delta(vi_json).await {
-                            Ok(response) => {
-                                estimator_response = Some(response.clone());
-                                if let Err(error) =
-                                    registry.apply_delta(&response, task_id, context.turn_index)
-                                {
-                                    warn!("lifecycle shadow delta rejected: {}", error);
-                                }
-                            }
-                            Err(error) => warn!(
-                                "lifecycle shadow estimator failed; registry unchanged: {}",
-                                error
-                            ),
-                        }
-                    }
-                    Err(error) => warn!("lifecycle shadow Vi build failed: {}", error),
-                }
-            }
-
-            let candidates = registry.candidate_task_ids(task_id, context.turn_index);
-            let mut eviction_trace = serde_json::json!({
-                "turnId": context.dialog_turn_id,
-                "turnIndex": context.turn_index,
-                "batchSize": lifecycle_batch_size,
-                "estimatorInput": estimator_input,
-                "estimatorResponse": estimator_response,
-                "candidateTaskIds": candidates,
-                "outcome": "no_candidate",
-            });
-            if !candidates.is_empty() {
-                match super::lifecycle_evict::build_eviction_plan(registry, &messages, &candidates)
-                {
-                    Ok(plan) => match Self::validate_lifecycle_artifacts(
-                        context.workspace.as_ref(),
-                        &context.session_id,
-                        &plan.artifact_handles,
-                    )
-                    .await
-                    {
-                        Ok(()) => match plan.apply(&messages) {
-                            Ok(rewritten) => {
-                                let evicted_messages =
-                                    messages.len().saturating_sub(rewritten.len());
-                                self.session_manager
-                                    .replace_context_messages(
-                                        &context.session_id,
-                                        rewritten.clone(),
-                                    )
-                                    .await;
-                                self.session_manager
-                                    .invalidate_prompt_cache(
-                                        &context.session_id,
-                                        crate::agentic::session::PromptCacheScope::All,
-                                        "lifecycle_eviction_applied",
-                                    )
-                                    .await;
-                                messages = rewritten;
-                                lifecycle_eviction_applied = true;
-                                registry.mark_tasks_evicted(&plan.task_ids);
-                                eviction_trace["outcome"] = serde_json::json!("evicted");
-                                eviction_trace["evictedTaskIds"] = serde_json::json!(plan.task_ids);
-                                eviction_trace["messageCountDelta"] =
-                                    serde_json::json!(evicted_messages);
-                                info!("lifecycle eviction applied: session={}, tasks={}, removed_messages={}", context.session_id, candidates.len(), evicted_messages);
-                            }
-                            Err(error) => {
-                                eviction_trace["outcome"] =
-                                    serde_json::json!("plan_apply_rejected");
-                                eviction_trace["reason"] = serde_json::json!(error.to_string());
-                                warn!("lifecycle eviction plan rejected: {}", error);
-                            }
-                        },
-                        Err(error) => {
-                            eviction_trace["outcome"] =
-                                serde_json::json!("artifact_validation_rejected");
-                            eviction_trace["reason"] = serde_json::json!(error.to_string());
-                            warn!("lifecycle eviction artifact validation rejected: {}", error);
-                        }
-                    },
-                    Err(error) => {
-                        eviction_trace["outcome"] = serde_json::json!("relocation_rejected");
-                        eviction_trace["reason"] = serde_json::json!(error.to_string());
-                        warn!("lifecycle eviction relocation rejected: {}", error);
-                    }
-                }
-            }
-            Self::write_lifecycle_eviction_trace(
-                context.workspace.as_ref(),
-                &context.session_id,
-                &context.dialog_turn_id,
-                &eviction_trace,
-            )
-            .await;
-
-            let candidate_count = registry
-                .candidate_task_ids(task_id, context.turn_index)
-                .len();
-            match serde_json::to_value(&*registry) {
-                Ok(value) => {
-                    if let Err(error) = self
-                        .session_manager
-                        .save_session_runtime_metadata(
-                            &context.session_id,
-                            super::lifecycle_evict::LIFECYCLE_REGISTRY_METADATA_KEY,
-                            value,
-                        )
-                        .await
-                    {
-                        warn!("lifecycle shadow registry save failed: {}", error);
-                    } else {
-                        info!("lifecycle shadow registry saved: session={}, version={}, tasks={}, segments={}, candidates={}",
-                            context.session_id, registry.version, registry.tasks.len(), registry.segments.len(), candidate_count);
-                    }
-                }
-                Err(error) => warn!("lifecycle shadow registry serialization failed: {}", error),
-            }
+        if let Some(registry) = lifecycle_registry.as_ref() {
+            self.persist_lifecycle_registry(&context.session_id, registry)
+                .await;
         }
 
         // Calculate newly generated messages
@@ -4055,39 +3897,187 @@ impl ExecutionEngine {
         })
     }
 
-    async fn validate_lifecycle_artifacts(
+    async fn run_lifecycle_batch(
+        &self,
+        registry: &mut super::lifecycle_evict::LifecycleRegistry,
+        messages: &mut Vec<Message>,
+        context: &ExecutionContext,
+    ) -> bool {
+        let tick_seq = registry.latest_tick_seq;
+        let mut estimator_input = None;
+        let mut estimator_response = None;
+        let mut trace = serde_json::json!({
+            "turnId": context.dialog_turn_id,
+            "tickSeq": tick_seq,
+            "batchSize": super::lifecycle_evict::LIFECYCLE_BATCH_SIZE,
+            "outcome": "estimator_not_run",
+        });
+        match registry.build_vi(&context.dialog_turn_id) {
+            Ok(input) => {
+                estimator_input = Some(input.clone());
+                match super::lifecycle_evict::estimate_registry_delta(input).await {
+                    Ok(response) => {
+                        estimator_response = Some(response.clone());
+                        if let Err(error) = registry.apply_delta(&response) {
+                            trace["outcome"] = serde_json::json!("delta_rejected");
+                            trace["reason"] = serde_json::json!(error.to_string());
+                        } else {
+                            trace["outcome"] = serde_json::json!("no_candidate");
+                        }
+                    }
+                    Err(error) => {
+                        trace["outcome"] = serde_json::json!("estimator_failed");
+                        trace["reason"] = serde_json::json!(error.to_string());
+                    }
+                }
+            }
+            Err(error) => {
+                trace["outcome"] = serde_json::json!("vi_rejected");
+                trace["reason"] = serde_json::json!(error.to_string());
+            }
+        }
+        trace["estimatorInput"] = serde_json::json!(estimator_input);
+        trace["estimatorResponse"] = serde_json::json!(estimator_response);
+
+        let candidates = registry.candidate_segment_ids();
+        trace["candidateSegmentIds"] = serde_json::json!(candidates);
+        let mut evicted = false;
+        if !candidates.is_empty() {
+            match super::lifecycle_evict::build_eviction_plan(registry, messages, &candidates) {
+                Ok(plan) => match Self::materialize_lifecycle_archives(
+                    context.workspace.as_ref(),
+                    &context.session_id,
+                    &plan,
+                    messages,
+                )
+                .await
+                {
+                    Ok(archives) => match plan.apply(messages, &archives) {
+                        Ok(rewritten) => {
+                            let removed_messages = messages.len().saturating_sub(rewritten.len());
+                            self.session_manager
+                                .replace_context_messages(&context.session_id, rewritten.clone())
+                                .await;
+                            self.session_manager
+                                .invalidate_prompt_cache(
+                                    &context.session_id,
+                                    crate::agentic::session::PromptCacheScope::All,
+                                    "lifecycle_segment_eviction_applied",
+                                )
+                                .await;
+                            *messages = rewritten;
+                            registry.mark_segments_evicted(&plan.segment_ids);
+                            trace["outcome"] = serde_json::json!("evicted");
+                            trace["evictedSegmentIds"] = serde_json::json!(plan.segment_ids);
+                            trace["archives"] = serde_json::json!(archives);
+                            trace["messageCountDelta"] = serde_json::json!(removed_messages);
+                            evicted = true;
+                        }
+                        Err(error) => {
+                            trace["outcome"] = serde_json::json!("plan_apply_rejected");
+                            trace["reason"] = serde_json::json!(error.to_string());
+                        }
+                    },
+                    Err(error) => {
+                        trace["outcome"] = serde_json::json!("archive_rejected");
+                        trace["reason"] = serde_json::json!(error.to_string());
+                    }
+                },
+                Err(error) => {
+                    trace["outcome"] = serde_json::json!("relocation_rejected");
+                    trace["reason"] = serde_json::json!(error.to_string());
+                }
+            }
+        }
+        Self::write_lifecycle_eviction_trace(
+            context.workspace.as_ref(),
+            &context.session_id,
+            &format!("{}-tick-{}", context.dialog_turn_id, tick_seq),
+            &trace,
+        )
+        .await;
+        self.persist_lifecycle_registry(&context.session_id, registry)
+            .await;
+        evicted
+    }
+
+    async fn materialize_lifecycle_archives(
         workspace: Option<&WorkspaceBinding>,
         session_id: &str,
-        artifact_handles: &[String],
-    ) -> BitFunResult<()> {
-        let workspace = workspace.ok_or_else(|| {
-            BitFunError::tool("lifecycle eviction requires a local workspace artifact store")
-        })?;
-        let artifact_dir = workspace
+        plan: &super::lifecycle_evict::LifecycleEvictionPlan,
+        messages: &[Message],
+    ) -> BitFunResult<HashMap<String, String>> {
+        let workspace = workspace
+            .ok_or_else(|| BitFunError::tool("lifecycle eviction requires workspace storage"))?;
+        let archive_dir = workspace
             .session_storage_dir()
             .join(session_id)
             .join("tool-results");
-        for handle in artifact_handles {
-            let file_name = Path::new(handle).file_name().ok_or_else(|| {
-                BitFunError::tool(format!("lifecycle artifact has no file name: {handle}"))
-            })?;
-            let canonical_path = artifact_dir.join(file_name);
-            let metadata = tokio::fs::metadata(&canonical_path)
-                .await
-                .map_err(|error| {
-                    BitFunError::tool(format!(
-                        "lifecycle artifact is unavailable {}: {error}",
-                        canonical_path.display()
-                    ))
-                })?;
-            if !metadata.is_file() {
-                return Err(BitFunError::tool(format!(
-                    "lifecycle artifact is not a file: {}",
-                    canonical_path.display()
-                )));
+        tokio::fs::create_dir_all(&archive_dir).await?;
+        let mut archives = HashMap::new();
+        for (segment_id, payload) in plan.archive_payloads(messages)? {
+            let digest = Sha256::digest(segment_id.as_bytes());
+            let file_name = format!("lifecycle-segment-{:x}.json", digest);
+            let path = archive_dir.join(&file_name);
+            let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+                "segmentId": segment_id,
+                "messages": payload,
+            }))?;
+            match tokio::fs::read(&path).await {
+                Ok(existing) if existing == bytes => {}
+                Ok(_) => {
+                    return Err(BitFunError::tool(format!(
+                        "lifecycle archive collision: {}",
+                        path.display()
+                    )))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let temporary =
+                        archive_dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
+                    tokio::fs::write(&temporary, &bytes).await?;
+                    let read_back = tokio::fs::read(&temporary).await?;
+                    if read_back != bytes {
+                        return Err(BitFunError::tool("lifecycle archive read-back mismatch"));
+                    }
+                    tokio::fs::rename(&temporary, &path).await?;
+                    if tokio::fs::read(&path).await? != bytes {
+                        return Err(BitFunError::tool(
+                            "lifecycle archive final verification failed",
+                        ));
+                    }
+                }
+                Err(error) => {
+                    return Err(BitFunError::io(format!(
+                        "lifecycle archive read failed: {error}"
+                    )))
+                }
             }
+            archives.insert(segment_id, path.display().to_string());
         }
-        Ok(())
+        Ok(archives)
+    }
+
+    async fn persist_lifecycle_registry(
+        &self,
+        session_id: &str,
+        registry: &super::lifecycle_evict::LifecycleRegistry,
+    ) {
+        match serde_json::to_value(registry) {
+            Ok(value) => {
+                if let Err(error) = self
+                    .session_manager
+                    .save_session_runtime_metadata(
+                        session_id,
+                        super::lifecycle_evict::LIFECYCLE_REGISTRY_METADATA_KEY,
+                        value,
+                    )
+                    .await
+                {
+                    warn!("lifecycle registry save failed: {}", error);
+                }
+            }
+            Err(error) => warn!("lifecycle registry serialization failed: {}", error),
+        }
     }
 
     async fn write_lifecycle_eviction_trace(

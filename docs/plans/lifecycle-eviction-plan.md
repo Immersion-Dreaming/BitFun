@@ -1255,3 +1255,30 @@ shadow mode 做同一模型/同一任务/多次运行的对照；不以单次 to
 `active -> evictable` 直跳、单轮 result 边界，以及 current/recent/error/pending Todo/
 缺 artifact 的候选拒绝；另覆盖稳定 ID 重定位的精确替换及 result ID 变化时拒绝。Step 3
 会在 `tool-results/lifecycle-eviction-<turn-id>.json` 写 estimator 输入/输出、候选、拒绝原因或删除结果。
+
+## 十、v4 tick/segment 实现（2026-08-04）
+
+上一版把一个 outer user turn 建模成一个 task，导致单个 SWE-bench prompt 内的几十个
+tool round 永远属于 current task，estimator 不会在长轨迹中触发有效 eviction。现版本
+采用以下边界：
+
+```text
+outer user turn     = 一次 SWE-bench 用户任务
+lifecycle tick      = 一次 assistant + 完整 tool results round
+provider request    = 一次模型 API 请求，不作为 eviction 状态单位
+```
+
+主 agent 忽略 subagent，完成每个 tool round 后递增 `latest_tick_seq`；每 3 个 tick 调用
+estimator，直接对 stable `segmentId` 输出 `active/completed/evictable`。第 3 个 tick
+时可以评估第 1 个旧 segment；候选不限制在最近三个 tick，最近两个 tick 只是硬保护尾部。
+
+物理删除流程：按 turn/tool-call ID 定位完整 segment，将 assistant/tool-result 原始消息
+完整写入 hash 命名的 immutable JSON archive 并 read-back 校验；任一 archive 写入、校验、
+重定位或范围检查失败，整批不改 context。成功后用包含 segment ID、工具、完成证据和
+archive 路径的 reminder 替换原范围，更新 session context，最后使 prompt cache 失效。
+
+当前代码状态：tick registry、segment state delta、尾部/error/Todo/状态跃迁硬护栏、原子
+archive 与 stable-ID replacement 已实现；subagent 暂不参与。生命周期单测为 4/4，覆盖同一
+outer turn 内按 tick 批处理、旧 segment eviction、直接跳跃拒绝、error/Todo 保护和
+tool-result ID 改变拒绝。下一轮真实 benchmark 必须使用单个长 SWE-bench session，观察第
+3、6、9... 个 tool tick 的 trace，而不能把三个独立 task 当成三个 turn。

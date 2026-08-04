@@ -994,3 +994,105 @@ mod tests {
 | `src/.../execution/lifecycle_evict.rs` | 新建 | 完整实现（~350行） |
 | `src/.../execution/execution_engine.rs` | 修改 | 5个 hook（~45行，新增 emergency truncation 重置） |
 | `src/.../execution/mod.rs` | 修改 | +1行 pub(crate) mod 声明 |
+
+---
+
+## 八、实测评估结论（2026-08-03，DeepSeek-v4-pro 三任务 A/B）
+
+> 数据来源：桌面 `main/` 与 `lifecycle/` 各三个 SWE-bench-Pro ansible 任务。
+> 两版唯一变量 = lifecycle eviction 开/关，模型均为 deepseek-v4-pro（经 openbitfun 网关）。
+> 分析人：Claude（Opus），下述"确认"项均有代码/patch/日志三重佐证；"推断"项已显式标注。
+
+### 8.1 修复本身：已确认生效 ✅
+
+`get_client_resolved("fast")` 修复后，estimator 在三个任务里**全部成功调用**，
+全目录 grep `claude-haiku` / `Model configuration not found` **零命中**。
+eviction 真实触发（5f4e33=8 次、a02e22=14 次、a26c32=31 次），
+`evicted_round_*.json` 归档与 INFO 日志逐条对应。上一版"21 次全失败"的 bug 已消除。
+
+### 8.2 高层指标对比
+
+| 任务 | 版本 | reward | steps | input tok | cost | exec(s) |
+|------|------|--------|-------|-----------|------|---------|
+| 5f4e33 | main | 1.0 | 78 | 1.41M | $0.034 | 314 |
+| 5f4e33 | **lifecycle** | **1.0** | 27 | **0.90M** | $0.055 | 801 |
+| a02e22 | main | 1.0 | 2* | 3.37M | $0.120 | 952 |
+| a02e22 | **lifecycle** | **0.0** ❌ | 24 | 2.06M | $0.113 | 1397 |
+| a26c32 | main | 1.0 | 121 | 3.78M | $0.059 | 499 |
+| a26c32 | **lifecycle** | **1.0** | 37 | **4.07M** ↑ | **$0.164** ↑2.8x | 2304 |
+
+\* main a02e22 的 steps=2 是主循环轮次，实际工作经 subagent 完成（两版执行形态不同，见 8.5 混淆项）。
+
+### 8.3 严重回归：a02e22 lifecycle 失败根因（确认）
+
+**结论：eviction 版产出的 patch 不完整且运行即崩溃。**
+
+| | main（通过） | lifecycle（失败） |
+|---|---|---|
+| 改动文件 | **4 个** | **1 个**（仅 galaxy.py） |
+| patch 大小 | 8365 B | 2117 B |
+| `install_collections()` 签名加 offline | ✓ | ❌ 缺 |
+| `galaxy_api_proxy.py` 离线核心逻辑 | ✓ | ❌ 缺 |
+| `dependency_resolution` 透传 | ✓ | ❌ 缺 |
+
+**致命点（确认）**：lifecycle patch 在 galaxy.py 里调用 `install_collections(..., offline=offline)`，
+但从未修改该函数签名去接收 `offline` → 运行时 `TypeError: unexpected keyword argument 'offline'`。
+真正的离线逻辑（`_get_collection_versions` 返回空集、`get_signatures` 返回空、离线抛 GalaxyError）一行未实现。
+
+**因果链（确认部分）**：
+- trajectory 显示 agent 全程**提及/读取过全部 4 个文件**（collection/__init__ 15x、dependency_resolution 24x、galaxy_api_proxy 11x），证明它知道要改这些文件。
+- 但 evicted_round 归档里所有涉及这 3 个文件的段均为 **Read 操作（Edit=none）**，磁盘 patch ground truth 确认这 3 个文件**从未被成功写入**。
+- 上下文丢失症状明确：**同一个 1253 行 test_galaxy.py 被重复完整重读 4 次**（ai.log line 9210/10225/10484/10781），providers.py 亦重复重读。
+- eviction 极度激进：round 0–49 几乎每轮都进了 evicted_round 归档，14 次驱逐事件。
+
+**推断（未完全隔离）**：激进 eviction 清掉了"已规划/已探索哪些文件"的上下文，
+agent 丢失全局计划后陷入反复重读、只完成了 CLI 层 galaxy.py 的表面改动就耗尽 24 轮，
+提交了一个跑起来就崩的半成品。
+
+### 8.4 成本反例：a26c32 eviction 反而更贵（确认）
+
+lifecycle 版 input token（4.07M）**高于** main（3.78M），cost（$0.164）是 main（$0.059）的 **2.8 倍**。
+两版都通过（reward=1.0）。31 次驱逐 → 每次 `invalidate_prompt_cache` → 下次请求 cache miss + 前缀重建。
+**当驱逐过于频繁时，KV-cache 失效的重建代价超过驱逐节省的 token**——违背论文
+`freed_tokens × (B-1) > miss_penalty_once` 的收益前提。这是一个需要正视的设计风险，不是纯收益。
+
+### 8.5 混淆项（诚实标注，避免过度归因）
+
+1. **执行形态不同**：main a02e22 主要走 subagent（主循环 2 步），lifecycle 走主循环 24 步；
+   两者不是纯净同构对照，token 绝对值不可直接相减。
+2. **模型能力弱**：deepseek-v4-pro 本身较弱，即使无 eviction 也可能产出坏 patch；n=1 无法完全隔离。
+3. **样本量**：每任务 lifecycle 仅 1 次 run，回归结论是"强烈相关"而非"统计因果"。
+
+### 8.6 estimator 失控信号（确认，跨任务一致）
+
+guard 拦截次数（error 段被误判 evictable、被 `apply_state_updates` 硬护栏拦下）：
+**5f4e33=4、a02e22=0、a26c32=43**。a26c32 的 43 次说明 estimator 在长会话里
+指令遵循严重退化，把大量 error 段判成可驱逐——目前**唯一**拦住它的就是那条硬护栏。
+软规则（Rule 3/4/5：最近轮保留、不确定优先 completed）在代码层**无任何强制**。
+
+### 8.7 确定的改动方向（待审核后实施）
+
+排序依据：**不要在"刚被证明不可靠的 estimator"上加注**，优先确定性代码护栏。
+
+**P0 — 代码层硬护栏（确定性、可单测、直接堵住 a02e22 类灾难）**
+- 含 `Edit`/`Write`/`MultiEdit` 的段 → 强制不可驱逐（`apply_state_updates` 内拦截，与现有 error 护栏并列）。
+- 未完成 TodoWrite（有 in_progress/pending）的段 → 强制不可驱逐。
+- 保留最近 N 轮强制 Active（`current_round - round_index < N`）。
+
+**P0 — estimator I/O 结构化落盘**
+- 已加 debug 日志（Vi/reasoning/raw text/parsed decision，见 commit 待补）。
+- 进一步：把 `vi_json + reasoning + state_updates` 写 `tool-results/estimator_batch_<round>.json`，
+  便于事后审计（本次就是没落盘才拿不到思考原文）。
+
+**P1 — 频率/成本自适应（针对 8.4）**
+- 驱逐前估算 `freed_tokens`，低于 miss 阈值则跳过本批，避免 a26c32 式负收益。
+- 或动态调大 B（batch_size），降低 cache 失效频率。
+
+**P1 — Vi 补语义（针对 8.6，但排在硬护栏之后）**
+- SegmentView 纳入 assistant reasoning 摘要（注意 deepseek `inline_think_in_text: true`，
+  思考内联在文本里，当前 `build_segment_view` 的 `Mixed { tool_calls, .. }` 把文本整个丢了 → 双重丢失）。
+- Edit 段标注 `is_edit`、TodoWrite 段纳入 todo 状态。
+
+**未决（需你拍板）**：是否给 lifecycle eviction 加"仅在接近压缩阈值时才启动"的开关——
+a26c32/5f4e33 峰值 usage 都远低于阈值（<30%），此时激进驱逐纯属亏本；
+eviction 的价值本应体现在"逼近 context 上限、否则要走有损压缩"的场景。

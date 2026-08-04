@@ -10,7 +10,7 @@ use crate::agentic::core::message::{
 };
 use crate::util::errors::{BitFunError, BitFunResult};
 use crate::util::types::Message as AIMessage;
-use log::{info, warn};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -28,8 +28,20 @@ const PERSISTED_PREVIEW_SEARCH: &str = "---Preview";
 /// Char limit for the task-context snippet fed to the estimator.
 const TASK_CONTEXT_CHARS: usize = 500;
 
+/// Char limit for the per-segment "intent" snippet (assistant reasoning + text)
+/// carried into Vi. This is the round's planning/reasoning signal — without it
+/// the estimator only sees a de-semanticised tool-call flow and cannot tell a
+/// planning round from a throwaway exploration round.
+const INTENT_PREVIEW_CHARS: usize = 800;
+
 const ESTIMATOR_SYSTEM_PROMPT: &str = r#"You are a context lifecycle manager for a software engineering AI agent.
 Analyze the historical tool call segments and determine which are still needed.
+
+Each segment may include an "intent" field: the assistant's own reasoning/plan for that
+round (why it ran those tools). Use it to judge lifecycle state — a round whose intent
+describes planning or a decision that later rounds build on ("I will edit these 6 files…",
+"the fix requires changing install_collections") is NOT a throwaway probe, even if its tools
+are just Read/Grep. Weigh intent over the raw tool names.
 
 For each segment, assign ONE state:
 - "active": outputs currently being built upon or referenced
@@ -45,6 +57,8 @@ Rules:
 6. Some results may show "[Observation deduped: identical content already present at context position N...]"
    This means the same content appeared in an earlier round. Treat such segments as if their results
    were real outputs — the dedup marker just means the content was already seen.
+7. If a segment's intent states or implies later work depends on it (a plan, a chosen approach,
+   an interface it will modify), keep it "active" or "completed" — do NOT mark it evictable.
 
 Respond ONLY with valid JSON. Include only rounds whose state should change:
 {"state_updates": {"0": "evictable", "3": "completed"}}"#;
@@ -64,6 +78,12 @@ pub(crate) enum SegmentState {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SegmentView {
     round_index: usize,
+    /// The round's planning/reasoning signal: assistant reasoning_content and/or
+    /// text that accompanied the tool calls. Lets the estimator distinguish a
+    /// planning round ("I will edit these 6 files…") from a throwaway probe.
+    /// Empty string when the round had no reasoning/text.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    intent: String,
     tool_calls: Vec<ToolCallView>,
     results: Vec<ResultView>,
 }
@@ -170,6 +190,11 @@ impl LifecycleEvictionManager {
             }
         };
 
+        debug!(
+            "lifecycle estimator DECISION (parsed state_updates): {:?}",
+            state_updates
+        );
+
         self.apply_state_updates(state_updates);
         let evicted = self.execute_eviction(messages, tool_results_dir).await?;
 
@@ -231,6 +256,8 @@ impl LifecycleEvictionManager {
             BitFunError::AIClient(format!("lifecycle estimator client: {e}"))
         })?;
 
+        debug!("lifecycle estimator INPUT (Vi):\n{}", vi_json);
+
         let req = vec![
             AIMessage::system(ESTIMATOR_SYSTEM_PROMPT.to_string()),
             AIMessage::user(vi_json),
@@ -239,6 +266,13 @@ impl LifecycleEvictionManager {
             .send_message_with_trace(req, None, None)
             .await
             .map_err(|e| BitFunError::AIClient(format!("lifecycle estimator request: {e}")))?;
+
+        if let Some(reasoning) = response.reasoning_content.as_deref() {
+            if !reasoning.is_empty() {
+                debug!("lifecycle estimator REASONING:\n{}", reasoning);
+            }
+        }
+        debug!("lifecycle estimator OUTPUT (raw text):\n{}", response.text);
 
         parse_estimator_response(&response.text)
     }
@@ -397,15 +431,41 @@ fn build_segment_view(
     asst_idx: usize,
     end_idx: usize,
 ) -> SegmentView {
-    let tool_calls = match &messages[asst_idx].content {
-        MessageContent::Mixed { tool_calls, .. } => tool_calls
-            .iter()
-            .map(|tc| ToolCallView {
-                tool_name: tc.tool_name.clone(),
-                args_json: serde_json::to_string(&tc.arguments).unwrap_or_default(),
-            })
-            .collect(),
-        _ => vec![],
+    // Extract both the assistant's planning intent and its tool calls.
+    // Reasoning lives in `reasoning_content` for interleaved-thinking models
+    // (e.g. Anthropic) and inline in `text` for models like deepseek
+    // (inline_think_in_text=true). Capture both so the estimator can tell a
+    // planning round apart from a mechanical exploration round.
+    let (intent, tool_calls) = match &messages[asst_idx].content {
+        MessageContent::Mixed {
+            reasoning_content,
+            text,
+            tool_calls,
+        } => {
+            let mut intent_parts: Vec<&str> = Vec::new();
+            if let Some(r) = reasoning_content.as_deref() {
+                if !r.trim().is_empty() {
+                    intent_parts.push(r.trim());
+                }
+            }
+            if !text.trim().is_empty() {
+                intent_parts.push(text.trim());
+            }
+            let intent = if intent_parts.is_empty() {
+                None
+            } else {
+                Some(truncate_chars(&intent_parts.join("\n"), INTENT_PREVIEW_CHARS))
+            };
+            let views = tool_calls
+                .iter()
+                .map(|tc| ToolCallView {
+                    tool_name: tc.tool_name.clone(),
+                    args_json: serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                })
+                .collect();
+            (intent, views)
+        }
+        _ => (None, vec![]),
     };
 
     let results = messages[asst_idx + 1..end_idx]
@@ -430,7 +490,7 @@ fn build_segment_view(
         })
         .collect();
 
-    SegmentView { round_index, tool_calls, results }
+    SegmentView { round_index, intent: intent.unwrap_or_default(), tool_calls, results }
 }
 
 fn extract_result_preview(content: &str, is_persisted: bool) -> String {
@@ -614,6 +674,43 @@ mod tests {
     }
 
     #[test]
+    fn intent_captured_from_assistant_text() {
+        // deepseek path: planning reasoning is inline in the assistant text.
+        let mut msgs = vec![
+            Message::system("sys".to_string()),
+            Message::user("task".to_string()),
+        ];
+        let tool_calls = vec![ToolCall {
+            tool_id: "id_0".to_string(),
+            tool_name: "Read".to_string(),
+            arguments: serde_json::json!({"file": "galaxy.py"}),
+            ..Default::default()
+        }];
+        msgs.push(Message::assistant_with_tools(
+            "I will add --offline and thread it through 4 files.".to_string(),
+            tool_calls,
+        ));
+        msgs.push(Message::tool_result(ToolResult {
+            tool_id: "id_0".to_string(),
+            tool_name: "Read".to_string(),
+            result: serde_json::json!({}),
+            result_for_assistant: Some("file contents".to_string()),
+            is_error: false,
+            duration_ms: None,
+            image_attachments: None,
+        }));
+
+        let mut mgr = LifecycleEvictionManager::new(3);
+        mgr.record_segment(&msgs, 0, 2);
+        assert_eq!(mgr.segments.len(), 1);
+        assert!(
+            mgr.segments[0].view.intent.contains("--offline"),
+            "intent should capture the assistant's planning text, got: {:?}",
+            mgr.segments[0].view.intent
+        );
+    }
+
+    #[test]
     fn text_only_round_not_recorded() {
         let msgs = vec![
             Message::system("sys".to_string()),
@@ -702,7 +799,7 @@ mod tests {
         }
 
         let empty_view =
-            |idx| SegmentView { round_index: idx, tool_calls: vec![], results: vec![] };
+            |idx| SegmentView { round_index: idx, intent: String::new(), tool_calls: vec![], results: vec![] };
 
         let mut mgr = LifecycleEvictionManager::new(3);
         mgr.segments = vec![

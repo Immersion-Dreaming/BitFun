@@ -1,841 +1,608 @@
-//! Lifecycle-Aware Eviction (TokenPilot paper, Section 3.3)
+//! Persistent lifecycle registry for the TokenPilot-inspired rollout.
 //!
-//! Maintains a registry of tool-call segments with monotone lifecycle states
-//! (Active → Completed → Evictable). Every B rounds a Haiku estimator is
-//! called to produce state updates ΔR; completed segments are physically
-//! drained from the message vec and replaced with a one-line summary.
+//! Step 1 records state across user turns. Step 2 asks an estimator for state
+//! deltas and exposes only conservatively validated candidates. This module
+//! never rewrites message history or invalidates the provider prompt cache.
 
-use crate::agentic::core::message::{
-    InternalReminderKind, Message, MessageContent, ToolCall, ToolResult,
-};
+use crate::agentic::core::message::{Message, MessageContent, ToolCall};
 use crate::util::errors::{BitFunError, BitFunResult};
 use crate::util::types::Message as AIMessage;
-use log::{debug, info, warn};
+use log::warn;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
-// ── Constants ────────────────────────────────────────────────────────────────
-
-pub(crate) const LIFECYCLE_BATCH_SIZE: usize = 3;
-
-/// Char limit for regular (non-persisted) tool result previews in Vi.
-const RESULT_PREVIEW_CHARS: usize = 600;
-
-/// Partial match for the preview-section header inside a persisted tool result.
-/// N is dynamic (TOOL_RESULT_PREVIEW_CHARS), so we match the prefix only —
-/// same technique as observation_dedup.rs:160.
-const PERSISTED_PREVIEW_SEARCH: &str = "---Preview";
-
-/// Char limit for the task-context snippet fed to the estimator.
-const TASK_CONTEXT_CHARS: usize = 500;
-
-/// Char limit for the per-segment "intent" snippet (assistant reasoning + text)
-/// carried into Vi. This is the round's planning/reasoning signal — without it
-/// the estimator only sees a de-semanticised tool-call flow and cannot tell a
-/// planning round from a throwaway exploration round.
+pub(crate) const LIFECYCLE_REGISTRY_METADATA_KEY: &str = "lifecycleEvictionRegistry";
+pub(crate) const RECENT_SEGMENTS_TO_PROTECT: usize = 2;
 const INTENT_PREVIEW_CHARS: usize = 800;
 
-const ESTIMATOR_SYSTEM_PROMPT: &str = r#"You are a context lifecycle manager for a software engineering AI agent.
-Analyze the historical tool call segments and determine which are still needed.
-
-Each segment may include an "intent" field: the assistant's own reasoning/plan for that
-round (why it ran those tools). Use it to judge lifecycle state — a round whose intent
-describes planning or a decision that later rounds build on ("I will edit these 6 files…",
-"the fix requires changing install_collections") is NOT a throwaway probe, even if its tools
-are just Read/Grep. Weigh intent over the raw tool names.
-
-For each segment, assign ONE state:
-- "active": outputs currently being built upon or referenced
-- "completed": sub-task done, may still have downstream dependencies
-- "evictable": sub-task fully done AND outputs no longer needed
-
-Rules:
-1. NEVER mark segments containing error results as evictable.
-2. If a file was Read in round N but later Written/Edited to the same path, round N's Read is likely evictable.
-3. The 2 most recent rounds should generally stay "active".
-4. When uncertain, prefer "completed" over "evictable".
-5. Only mark "evictable" when confident the content is no longer needed.
-6. Some results may show "[Observation deduped: identical content already present at context position N...]"
-   This means the same content appeared in an earlier round. Treat such segments as if their results
-   were real outputs — the dedup marker just means the content was already seen.
-7. If a segment's intent states or implies later work depends on it (a plan, a chosen approach,
-   an interface it will modify), keep it "active" or "completed" — do NOT mark it evictable.
-
-Respond ONLY with valid JSON. Include only rounds whose state should change:
-{"state_updates": {"0": "evictable", "3": "completed"}}"#;
-
-// ── State machine ────────────────────────────────────────────────────────────
-
-/// Monotone lifecycle state — values are ordered so `>` means "further along".
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum SegmentState {
-    Active = 0,
-    Completed = 1,
-    Evictable = 2,
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct LifecycleRegistry {
+    #[serde(default)]
+    pub(crate) version: u64,
+    #[serde(default)]
+    pub(crate) last_processed_turn_seq: usize,
+    #[serde(default)]
+    pub(crate) tasks: BTreeMap<String, LifecycleTask>,
+    #[serde(default)]
+    pub(crate) segments: BTreeMap<String, LifecycleSegment>,
 }
 
-// ── View types (serialised into Vi for the estimator) ────────────────────────
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct SegmentView {
-    round_index: usize,
-    /// The round's planning/reasoning signal: assistant reasoning_content and/or
-    /// text that accompanied the tool calls. Lets the estimator distinguish a
-    /// planning round ("I will edit these 6 files…") from a throwaway probe.
-    /// Empty string when the round had no reasoning/text.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    intent: String,
-    tool_calls: Vec<ToolCallView>,
-    results: Vec<ResultView>,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct LifecycleTask {
+    pub(crate) id: String,
+    pub(crate) objective: String,
+    pub(crate) state: LifecycleTaskState,
+    #[serde(default)]
+    pub(crate) covered_turn_ids: Vec<String>,
+    #[serde(default)]
+    pub(crate) completion_evidence: Vec<String>,
+    #[serde(default)]
+    pub(crate) unresolved_questions: Vec<String>,
+    #[serde(default)]
+    pub(crate) segment_ids: Vec<String>,
+    pub(crate) last_touched_turn_seq: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct ToolCallView {
-    tool_name: String,
-    /// Full args JSON — not truncated; cross-round dependency detection needs the full args.
-    args_json: String,
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LifecycleTaskState {
+    Active,
+    Blocked,
+    Completed,
+    Evictable,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct ResultView {
-    tool_name: String,
-    /// For persisted results: text after the "---Preview…---\n" header line.
-    /// For regular results: first RESULT_PREVIEW_CHARS chars.
-    preview: String,
-    is_error: bool,
-    is_persisted: bool,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct LifecycleSegment {
+    pub(crate) id: String,
+    pub(crate) turn_id: String,
+    pub(crate) turn_seq: usize,
+    #[serde(default)]
+    pub(crate) tool_call_ids: Vec<String>,
+    #[serde(default)]
+    pub(crate) tool_names: Vec<String>,
+    #[serde(default)]
+    pub(crate) task_ids: Vec<String>,
+    #[serde(default)]
+    pub(crate) artifact_handles: Vec<String>,
+    pub(crate) has_error: bool,
+    pub(crate) has_pending_todo: bool,
+    pub(crate) token_estimate: usize,
+    #[serde(default)]
+    pub(crate) intent: String,
 }
 
-// ── Core segment record ───────────────────────────────────────────────────────
-
-struct ContextSegment {
-    round_index: usize,
-    /// Index in the message vec of this round's Assistant message.
-    assistant_msg_idx: usize,
-    /// Exclusive upper bound: tool results occupy [assistant_msg_idx+1, end_idx).
-    end_idx: usize,
-    state: SegmentState,
-    /// Pre-computed view used in Vi construction.
-    view: SegmentView,
+#[derive(Debug, Deserialize)]
+struct LifecycleEstimatorDelta {
+    #[serde(rename = "baseVersion")]
+    base_version: u64,
+    #[serde(rename = "taskUpdates")]
+    task_updates: Vec<LifecycleTaskUpdate>,
 }
 
-// ── Manager ───────────────────────────────────────────────────────────────────
-
-pub(crate) struct LifecycleEvictionManager {
-    /// Registry R from the paper — maintained incrementally across batches.
-    segments: Vec<ContextSegment>,
-    batch_size: usize,
+#[derive(Debug, Deserialize)]
+struct LifecycleTaskUpdate {
+    #[serde(rename = "taskId")]
+    task_id: String,
+    objective: Option<String>,
+    lifecycle: LifecycleTaskState,
+    #[serde(rename = "coveredTurnAbsIds", default)]
+    covered_turn_ids: Vec<String>,
+    #[serde(rename = "completionEvidence", default)]
+    completion_evidence: Vec<String>,
+    #[serde(rename = "unresolvedQuestions", default)]
+    unresolved_questions: Vec<String>,
 }
 
-impl LifecycleEvictionManager {
-    pub(crate) fn new(batch_size: usize) -> Self {
-        Self { segments: Vec::new(), batch_size }
+impl LifecycleRegistry {
+    /// Each turn starts provisionally. The estimator can later attach it to an
+    /// earlier active task by returning both IDs in `coveredTurnAbsIds`.
+    pub(crate) fn begin_turn(
+        &mut self,
+        turn_id: &str,
+        turn_seq: usize,
+        objective: String,
+    ) -> String {
+        let task_id = format!("{turn_id}-task");
+        self.tasks
+            .entry(task_id.clone())
+            .or_insert_with(|| LifecycleTask {
+                id: task_id.clone(),
+                objective,
+                state: LifecycleTaskState::Active,
+                covered_turn_ids: vec![turn_id.to_string()],
+                completion_evidence: vec![],
+                unresolved_questions: vec![],
+                segment_ids: vec![],
+                last_touched_turn_seq: turn_seq,
+            });
+        task_id
     }
 
-    /// Record the just-completed round as a ContextSegment.
-    ///
-    /// Call this after all tool results for the round have been pushed to
-    /// `messages`.  `assistant_msg_idx` must be the index captured immediately
-    /// after pushing the assistant message (i.e. `messages.len() - 1` at that
-    /// point).  Pure-text rounds (no tool calls) are silently skipped.
+    /// `end_idx` is exclusive and captured immediately after this round's tool
+    /// results. It prevents a future round from being attributed retroactively.
     pub(crate) fn record_segment(
         &mut self,
         messages: &[Message],
-        round_index: usize,
         assistant_msg_idx: usize,
+        end_idx: usize,
+        turn_id: &str,
+        turn_seq: usize,
+        task_id: &str,
     ) {
-        let end_idx = messages.len();
-
-        let has_tool_calls = matches!(
-            &messages[assistant_msg_idx].content,
-            MessageContent::Mixed { tool_calls, .. } if !tool_calls.is_empty()
-        );
-        if !has_tool_calls || end_idx <= assistant_msg_idx + 1 {
-            return;
-        }
-
-        let view = build_segment_view(round_index, messages, assistant_msg_idx, end_idx);
-        self.segments.push(ContextSegment {
-            round_index,
-            assistant_msg_idx,
-            end_idx,
-            state: SegmentState::Active,
-            view,
-        });
-    }
-
-    /// Returns true when `round_index` is a batch boundary and there is at
-    /// least one segment to evaluate.
-    pub(crate) fn should_run_estimator(&self, round_index: usize) -> bool {
-        (round_index + 1) % self.batch_size == 0 && !self.segments.is_empty()
-    }
-
-    /// Run a full eviction cycle for this batch boundary.
-    ///
-    /// On estimator failure the method returns `Ok(0)` — eviction is skipped
-    /// rather than propagating an error, so the agent continues uninterrupted.
-    pub(crate) async fn run_batch_eviction(
-        &mut self,
-        messages: &mut Vec<Message>,
-        round_index: usize,
-        task_context: &str,
-        tool_results_dir: Option<&std::path::Path>,
-    ) -> BitFunResult<usize> {
-        let vi_json = self.build_vi(round_index, task_context)?;
-
-        let state_updates = match self.call_estimator(vi_json).await {
-            Ok(updates) => updates,
-            Err(e) => {
-                warn!("lifecycle eviction: estimator failed, skipping batch: {}", e);
-                return Ok(0);
-            }
-        };
-
-        debug!(
-            "lifecycle estimator DECISION (parsed state_updates): {:?}",
-            state_updates
-        );
-
-        self.apply_state_updates(state_updates);
-        let evicted = self.execute_eviction(messages, tool_results_dir).await?;
-
-        if evicted > 0 {
-            info!(
-                "lifecycle eviction: round={}, evicted={} segments, messages_len={}",
-                round_index,
-                evicted,
-                messages.len()
-            );
-        }
-        Ok(evicted)
-    }
-
-    /// Clear all segment records after a full compression or emergency truncation —
-    /// all stored message indices are stale after either event.
-    pub(crate) fn reset_after_compression(&mut self) {
-        self.segments.clear();
-    }
-
-    // ── Private helpers ───────────────────────────────────────────────────────
-
-    /// Build Vi: the compressed historical view sent to the estimator.
-    fn build_vi(&self, round_index: usize, task_context: &str) -> BitFunResult<String> {
-        #[derive(Serialize)]
-        struct EstimatorInput<'a> {
-            current_task: &'a str,
-            current_round: usize,
-            segments: Vec<&'a SegmentView>,
-        }
-        let input = EstimatorInput {
-            current_task: task_context,
-            current_round: round_index,
-            segments: self
-                .segments
-                .iter()
-                .filter(|s| s.state != SegmentState::Evictable)
-                .map(|s| &s.view)
-                .collect(),
-        };
-        serde_json::to_string(&input).map_err(|e| {
-            BitFunError::tool(format!("lifecycle eviction: Vi serialization: {e}"))
-        })
-    }
-
-    /// Send Vi to the Haiku estimator and return parsed state updates.
-    async fn call_estimator(
-        &self,
-        vi_json: String,
-    ) -> BitFunResult<std::collections::HashMap<usize, SegmentState>> {
-        use crate::infrastructure::ai::get_global_ai_client_factory;
-
-        let factory = get_global_ai_client_factory().await.map_err(|e| {
-            BitFunError::AIClient(format!("lifecycle estimator factory: {e}"))
-        })?;
-
-        // get_client_resolved handles "fast" → primary fallback internally.
-        let client = factory.get_client_resolved("fast").await.map_err(|e| {
-            BitFunError::AIClient(format!("lifecycle estimator client: {e}"))
-        })?;
-
-        debug!("lifecycle estimator INPUT (Vi):\n{}", vi_json);
-
-        let req = vec![
-            AIMessage::system(ESTIMATOR_SYSTEM_PROMPT.to_string()),
-            AIMessage::user(vi_json),
-        ];
-        let response = client
-            .send_message_with_trace(req, None, None)
-            .await
-            .map_err(|e| BitFunError::AIClient(format!("lifecycle estimator request: {e}")))?;
-
-        if let Some(reasoning) = response.reasoning_content.as_deref() {
-            if !reasoning.is_empty() {
-                debug!("lifecycle estimator REASONING:\n{}", reasoning);
-            }
-        }
-        debug!("lifecycle estimator OUTPUT (raw text):\n{}", response.text);
-
-        parse_estimator_response(&response.text)
-    }
-
-    /// Apply ΔR updates to the registry (R_i ← R_{i-1} ⊕ ΔR_i).
-    /// States are monotone: a segment can only advance, never regress.
-    pub(crate) fn apply_state_updates(
-        &mut self,
-        updates: std::collections::HashMap<usize, SegmentState>,
-    ) {
-        for seg in self.segments.iter_mut() {
-            let Some(new_state) = updates.get(&seg.round_index) else {
-                continue;
-            };
-            // Double guard: the estimator system prompt prohibits this, but
-            // we enforce it in code as well.
-            if *new_state == SegmentState::Evictable
-                && seg.view.results.iter().any(|r| r.is_error)
-            {
-                warn!(
-                    "lifecycle: estimator marked error segment {} as evictable, ignoring",
-                    seg.round_index
-                );
-                continue;
-            }
-            if *new_state > seg.state {
-                seg.state = new_state.clone();
-            }
-        }
-    }
-
-    /// Physically drain evictable segments from `messages`, insert summary
-    /// placeholders, and reindex surviving segments.
-    async fn execute_eviction(
-        &mut self,
-        messages: &mut Vec<Message>,
-        tool_results_dir: Option<&std::path::Path>,
-    ) -> BitFunResult<usize> {
-        struct EvictTarget {
-            round_index: usize,
-            asst_idx: usize,
-            end_idx: usize,
-        }
-
-        let mut targets: Vec<EvictTarget> = self
-            .segments
-            .iter()
-            .filter(|s| s.state == SegmentState::Evictable)
-            .map(|s| EvictTarget {
-                round_index: s.round_index,
-                asst_idx: s.assistant_msg_idx,
-                end_idx: s.end_idx,
-            })
-            .collect();
-
-        if targets.is_empty() {
-            return Ok(0);
-        }
-
-        // Process highest index first so earlier indices remain valid.
-        targets.sort_by(|a, b| b.asst_idx.cmp(&a.asst_idx));
-
-        for target in &targets {
-            // Save a recovery file (best-effort; failure does not block eviction).
-            let recovery_path = if let Some(dir) = tool_results_dir {
-                match save_recovery_file(
-                    target.round_index,
-                    target.asst_idx,
-                    target.end_idx,
-                    messages,
-                    dir,
-                )
-                .await
-                {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        warn!(
-                            "lifecycle: recovery file failed for round {}: {}",
-                            target.round_index, e
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-            let tool_names: String = self
-                .segments
-                .iter()
-                .find(|s| s.round_index == target.round_index)
-                .map(|s| {
-                    s.view
-                        .tool_calls
-                        .iter()
-                        .map(|tc| tc.tool_name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default();
-
-            let recovery_hint = recovery_path
-                .as_ref()
-                .map(|p| {
-                    format!(
-                        "\nFull content saved to: {}\nUse the Read tool to recover if needed.",
-                        p.display()
-                    )
-                })
-                .unwrap_or_default();
-
-            let summary_text = format!(
-                "[LIFECYCLE_EVICTION_SUMMARY: round={}]\nSub-task completed and evicted. Tools: [{}].{}",
-                target.round_index, tool_names, recovery_hint,
-            );
-            let summary_msg = Message::internal_reminder(
-                InternalReminderKind::LifecycleEvictionSummary,
-                summary_text,
-            );
-
-            messages.drain(target.asst_idx..target.end_idx);
-            messages.insert(target.asst_idx, summary_msg);
-        }
-
-        // Reindex surviving segments using the original (pre-eviction) indices,
-        // processed in ascending order so each shift accumulates correctly.
-        let mut targets_asc = targets;
-        targets_asc.sort_by_key(|t| t.asst_idx);
-
-        for seg in self.segments.iter_mut() {
-            if seg.state == SegmentState::Evictable {
-                continue;
-            }
-            // Only targets fully before this segment contribute a shift.
-            let shift: isize = targets_asc
-                .iter()
-                .filter(|t| t.end_idx <= seg.assistant_msg_idx)
-                .map(|t| 1isize - (t.end_idx as isize - t.asst_idx as isize))
-                .sum();
-
-            seg.assistant_msg_idx = (seg.assistant_msg_idx as isize + shift) as usize;
-            seg.end_idx = (seg.end_idx as isize + shift) as usize;
-        }
-
-        self.segments.retain(|s| s.state != SegmentState::Evictable);
-
-        Ok(targets_asc.len())
-    }
-}
-
-// ── Module-level helpers ──────────────────────────────────────────────────────
-
-fn build_segment_view(
-    round_index: usize,
-    messages: &[Message],
-    asst_idx: usize,
-    end_idx: usize,
-) -> SegmentView {
-    // Extract both the assistant's planning intent and its tool calls.
-    // Reasoning lives in `reasoning_content` for interleaved-thinking models
-    // (e.g. Anthropic) and inline in `text` for models like deepseek
-    // (inline_think_in_text=true). Capture both so the estimator can tell a
-    // planning round apart from a mechanical exploration round.
-    let (intent, tool_calls) = match &messages[asst_idx].content {
-        MessageContent::Mixed {
+        let Some(MessageContent::Mixed {
             reasoning_content,
             text,
             tool_calls,
-        } => {
-            let mut intent_parts: Vec<&str> = Vec::new();
-            if let Some(r) = reasoning_content.as_deref() {
-                if !r.trim().is_empty() {
-                    intent_parts.push(r.trim());
-                }
-            }
-            if !text.trim().is_empty() {
-                intent_parts.push(text.trim());
-            }
-            let intent = if intent_parts.is_empty() {
-                None
-            } else {
-                Some(truncate_chars(&intent_parts.join("\n"), INTENT_PREVIEW_CHARS))
-            };
-            let views = tool_calls
-                .iter()
-                .map(|tc| ToolCallView {
-                    tool_name: tc.tool_name.clone(),
-                    args_json: serde_json::to_string(&tc.arguments).unwrap_or_default(),
-                })
-                .collect();
-            (intent, views)
+        }) = messages
+            .get(assistant_msg_idx)
+            .map(|message| &message.content)
+        else {
+            return;
+        };
+        if tool_calls.is_empty() {
+            return;
         }
-        _ => (None, vec![]),
-    };
-
-    let results = messages[asst_idx + 1..end_idx]
-        .iter()
-        .filter_map(|m| match &m.content {
-            MessageContent::ToolResult {
-                tool_name,
-                result_for_assistant,
-                is_error,
-                ..
-            } => {
-                let text = result_for_assistant.as_deref().unwrap_or("");
-                let is_persisted = bitfun_agent_tools::tool_result_is_persisted_output(text);
-                Some(ResultView {
-                    tool_name: tool_name.clone(),
-                    preview: extract_result_preview(text, is_persisted),
-                    is_error: *is_error,
-                    is_persisted,
-                })
-            }
-            _ => None,
-        })
-        .collect();
-
-    SegmentView { round_index, intent: intent.unwrap_or_default(), tool_calls, results }
-}
-
-fn extract_result_preview(content: &str, is_persisted: bool) -> String {
-    if is_persisted {
-        // Partial match — N in "---Preview (first N chars)---" is dynamic.
-        if let Some(pos) = content.find(PERSISTED_PREVIEW_SEARCH) {
-            if let Some(newline) = content[pos..].find('\n') {
-                return content[pos + newline + 1..].to_string();
-            }
+        let Some(results) = messages.get(assistant_msg_idx + 1..end_idx) else {
+            warn!("lifecycle registry: invalid tool-result boundary");
+            return;
+        };
+        let tool_call_ids: Vec<String> =
+            tool_calls.iter().map(|call| call.tool_id.clone()).collect();
+        let segment_id = format!("{}:{}", turn_id, tool_call_ids.join(","));
+        if self.segments.contains_key(&segment_id) {
+            return;
+        }
+        let intent = [reasoning_content.as_deref().unwrap_or(""), text.as_str()]
+            .into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let segment = LifecycleSegment {
+            id: segment_id.clone(),
+            turn_id: turn_id.to_string(),
+            turn_seq,
+            tool_call_ids,
+            tool_names: tool_calls
+                .iter()
+                .map(|call| call.tool_name.clone())
+                .collect(),
+            task_ids: vec![task_id.to_string()],
+            artifact_handles: results
+                .iter()
+                .filter_map(artifact_handle_from_message)
+                .collect(),
+            has_error: results.iter().any(|message| {
+                matches!(
+                    &message.content,
+                    MessageContent::ToolResult { is_error: true, .. }
+                )
+            }),
+            has_pending_todo: tool_calls.iter().any(todo_call_has_pending_items),
+            token_estimate: results.iter().map(message_char_estimate).sum::<usize>() / 4,
+            intent: truncate_chars(&intent, INTENT_PREVIEW_CHARS),
+        };
+        self.segments.insert(segment_id.clone(), segment);
+        if let Some(task) = self.tasks.get_mut(task_id) {
+            task.segment_ids.push(segment_id);
+            task.last_touched_turn_seq = turn_seq;
         }
     }
-    truncate_chars(content, RESULT_PREVIEW_CHARS)
+
+    pub(crate) fn should_estimate(&self, turn_seq: usize, batch_size: usize) -> bool {
+        batch_size > 0 && (turn_seq + 1) % batch_size == 0 && !self.segments.is_empty()
+    }
+
+    pub(crate) fn build_vi(
+        &self,
+        current_task_id: &str,
+        current_turn_id: &str,
+        current_turn_seq: usize,
+    ) -> BitFunResult<String> {
+        #[derive(Serialize)]
+        struct Input<'a> {
+            #[serde(rename = "baseVersion")]
+            base_version: u64,
+            #[serde(rename = "currentTaskId")]
+            current_task_id: &'a str,
+            #[serde(rename = "currentTurnId")]
+            current_turn_id: &'a str,
+            tasks: Vec<&'a LifecycleTask>,
+            segments: Vec<&'a LifecycleSegment>,
+            #[serde(rename = "evictableCandidateTaskIds")]
+            candidates: Vec<&'a str>,
+        }
+        let candidate_ids = self.candidate_task_ids(current_task_id, current_turn_seq);
+        serde_json::to_string(&Input {
+            base_version: self.version,
+            current_task_id,
+            current_turn_id,
+            tasks: self.tasks.values().collect(),
+            segments: self.segments.values().collect(),
+            candidates: candidate_ids.iter().map(String::as_str).collect(),
+        })
+        .map_err(|error| BitFunError::tool(format!("lifecycle registry Vi serialization: {error}")))
+    }
+
+    pub(crate) fn apply_delta(
+        &mut self,
+        text: &str,
+        current_task_id: &str,
+        current_turn_seq: usize,
+    ) -> BitFunResult<()> {
+        let delta: LifecycleEstimatorDelta =
+            serde_json::from_str(extract_json_object(text).ok_or_else(|| {
+                BitFunError::tool("lifecycle estimator: no JSON object in response".to_string())
+            })?)
+            .map_err(|error| {
+                BitFunError::tool(format!("lifecycle estimator invalid delta: {error}"))
+            })?;
+        if delta.base_version != self.version {
+            return Err(BitFunError::tool(format!(
+                "lifecycle estimator stale baseVersion {} (expected {})",
+                delta.base_version, self.version
+            )));
+        }
+        for update in delta.task_updates {
+            if !self.tasks.contains_key(&update.task_id)
+                || !update
+                    .covered_turn_ids
+                    .iter()
+                    .all(|turn_id| self.turn_is_owned(turn_id))
+            {
+                warn!(
+                    "lifecycle estimator referenced unknown task or turn, skipping {}",
+                    update.task_id
+                );
+                continue;
+            }
+            for turn_id in &update.covered_turn_ids {
+                self.assign_turn_to_task(turn_id, &update.task_id);
+            }
+            let protected = self.task_has_protected_segment(&update.task_id, current_turn_seq);
+            let Some(task) = self.tasks.get_mut(&update.task_id) else {
+                continue;
+            };
+            let unsafe_completed = update.lifecycle == LifecycleTaskState::Completed
+                && update.completion_evidence.is_empty();
+            let unsafe_evictable = update.lifecycle == LifecycleTaskState::Evictable
+                && (update.task_id == current_task_id
+                    || update.completion_evidence.is_empty()
+                    || !update.unresolved_questions.is_empty()
+                    || protected
+                    || task.state != LifecycleTaskState::Completed);
+            if unsafe_completed || unsafe_evictable || update.lifecycle < task.state {
+                warn!(
+                    "lifecycle estimator proposed invalid transition for {}, skipping",
+                    update.task_id
+                );
+                continue;
+            }
+            task.state = update.lifecycle;
+            if let Some(objective) = update.objective.filter(|value| !value.trim().is_empty()) {
+                task.objective = objective;
+            }
+            task.completion_evidence = update.completion_evidence;
+            task.unresolved_questions = update.unresolved_questions;
+            task.last_touched_turn_seq = current_turn_seq;
+        }
+        self.version += 1;
+        self.last_processed_turn_seq = current_turn_seq;
+        Ok(())
+    }
+
+    pub(crate) fn candidate_task_ids(
+        &self,
+        current_task_id: &str,
+        current_turn_seq: usize,
+    ) -> Vec<String> {
+        self.tasks
+            .values()
+            .filter(|task| {
+                task.id != current_task_id
+                    && task.state == LifecycleTaskState::Evictable
+                    && !task.completion_evidence.is_empty()
+                    && task.unresolved_questions.is_empty()
+                    && !self.task_has_protected_segment(&task.id, current_turn_seq)
+            })
+            .map(|task| task.id.clone())
+            .collect()
+    }
+
+    fn turn_is_owned(&self, turn_id: &str) -> bool {
+        self.tasks
+            .values()
+            .any(|task| task.covered_turn_ids.iter().any(|id| id == turn_id))
+    }
+
+    fn task_has_protected_segment(&self, task_id: &str, current_turn_seq: usize) -> bool {
+        self.segments
+            .values()
+            .filter(|segment| segment.task_ids.iter().any(|id| id == task_id))
+            .any(|segment| {
+                segment.has_error
+                    || segment.has_pending_todo
+                    || segment.artifact_handles.is_empty()
+                    || current_turn_seq.saturating_sub(segment.turn_seq)
+                        < RECENT_SEGMENTS_TO_PROTECT
+            })
+    }
+
+    fn assign_turn_to_task(&mut self, turn_id: &str, target_task_id: &str) {
+        let sources: Vec<String> = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.id != target_task_id && task.covered_turn_ids.iter().any(|id| id == turn_id)
+            })
+            .map(|task| task.id.clone())
+            .collect();
+        if sources.is_empty() {
+            return;
+        }
+        let moved: Vec<String> = self
+            .segments
+            .values()
+            .filter(|segment| segment.turn_id == turn_id)
+            .map(|segment| segment.id.clone())
+            .collect();
+        for segment_id in &moved {
+            if let Some(segment) = self.segments.get_mut(segment_id) {
+                segment.task_ids.retain(|id| !sources.contains(id));
+                if !segment.task_ids.iter().any(|id| id == target_task_id) {
+                    segment.task_ids.push(target_task_id.to_string());
+                }
+            }
+        }
+        for source_id in &sources {
+            if let Some(source) = self.tasks.get_mut(source_id) {
+                source.covered_turn_ids.retain(|id| id != turn_id);
+                source.segment_ids.retain(|id| !moved.contains(id));
+            }
+        }
+        if let Some(target) = self.tasks.get_mut(target_task_id) {
+            if !target.covered_turn_ids.iter().any(|id| id == turn_id) {
+                target.covered_turn_ids.push(turn_id.to_string());
+            }
+            for segment_id in moved {
+                if !target.segment_ids.iter().any(|id| id == &segment_id) {
+                    target.segment_ids.push(segment_id);
+                }
+            }
+        }
+        self.tasks.retain(|_, task| {
+            !sources.contains(&task.id)
+                || !task.covered_turn_ids.is_empty()
+                || !task.segment_ids.is_empty()
+        });
+    }
 }
 
-/// Truncate `s` to at most `max` Unicode scalar values, appending "…" if cut.
-/// Exported so execution_engine.rs can use it for task_context extraction.
+pub(crate) async fn estimate_registry_delta(vi_json: String) -> BitFunResult<String> {
+    use crate::infrastructure::ai::get_global_ai_client_factory;
+    const PROMPT: &str = r#"You are a lifecycle state estimator. Return ONLY JSON with {"baseVersion": number, "taskUpdates": [...]}. Each update must use taskId, lifecycle (active|blocked|completed|evictable), coveredTurnAbsIds, completionEvidence, and unresolvedQuestions. completed requires completionEvidence. evictable requires completionEvidence, no unresolvedQuestions, and the current task must never be evictable. Do not invent task or turn IDs."#;
+    let factory = get_global_ai_client_factory()
+        .await
+        .map_err(|error| BitFunError::AIClient(format!("lifecycle estimator factory: {error}")))?;
+    let client = factory
+        .get_client_resolved("fast")
+        .await
+        .map_err(|error| BitFunError::AIClient(format!("lifecycle estimator client: {error}")))?;
+    let response = client
+        .send_message_with_trace(
+            vec![
+                AIMessage::system(PROMPT.to_string()),
+                AIMessage::user(vi_json),
+            ],
+            None,
+            None,
+        )
+        .await
+        .map_err(|error| BitFunError::AIClient(format!("lifecycle estimator request: {error}")))?;
+    Ok(response.text)
+}
+
+fn artifact_handle_from_message(message: &Message) -> Option<String> {
+    let MessageContent::ToolResult {
+        result_for_assistant: Some(text),
+        ..
+    } = &message.content
+    else {
+        return None;
+    };
+    text.lines()
+        .find_map(|line| line.strip_prefix("Full output saved to: "))
+        .map(str::to_string)
+}
+
+fn todo_call_has_pending_items(call: &ToolCall) -> bool {
+    call.tool_name == "TodoWrite"
+        && call
+            .arguments
+            .get("todos")
+            .and_then(|value| value.as_array())
+            .is_some_and(|todos| {
+                todos.iter().any(|todo| {
+                    matches!(
+                        todo.get("status").and_then(|value| value.as_str()),
+                        Some("pending" | "in_progress")
+                    )
+                })
+            })
+}
+
+fn message_char_estimate(message: &Message) -> usize {
+    match &message.content {
+        MessageContent::ToolResult {
+            result_for_assistant,
+            ..
+        } => result_for_assistant
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .count(),
+        _ => 0,
+    }
+}
+
 pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
     let mut chars = s.chars();
     let out: String = chars.by_ref().take(max).collect();
-    if chars.next().is_some() { format!("{out}…") } else { out }
-}
-
-fn parse_estimator_response(
-    text: &str,
-) -> BitFunResult<std::collections::HashMap<usize, SegmentState>> {
-    #[derive(Deserialize)]
-    struct EstimatorOutput {
-        state_updates: std::collections::HashMap<String, String>,
+    if chars.next().is_some() {
+        format!("{out}...")
+    } else {
+        out
     }
-
-    let json_str = extract_json_object(text).ok_or_else(|| {
-        BitFunError::tool(format!(
-            "lifecycle estimator: no JSON object in response: {text}"
-        ))
-    })?;
-
-    let output: EstimatorOutput = serde_json::from_str(json_str).map_err(|e| {
-        BitFunError::tool(format!(
-            "lifecycle estimator: invalid JSON ({e}): {json_str}"
-        ))
-    })?;
-
-    let mut result = std::collections::HashMap::new();
-    for (k, v) in output.state_updates {
-        let round: usize = match k.parse() {
-            Ok(n) => n,
-            Err(_) => {
-                warn!("lifecycle estimator: bad round key '{}', skipping", k);
-                continue;
-            }
-        };
-        let state = match v.as_str() {
-            "active" => SegmentState::Active,
-            "completed" => SegmentState::Completed,
-            "evictable" => SegmentState::Evictable,
-            other => {
-                warn!("lifecycle estimator: unknown state '{}', skipping", other);
-                continue;
-            }
-        };
-        result.insert(round, state);
-    }
-    Ok(result)
 }
 
 fn extract_json_object(text: &str) -> Option<&str> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
-    if end >= start { Some(&text[start..=end]) } else { None }
+    (end >= start).then_some(&text[start..=end])
 }
-
-async fn save_recovery_file(
-    round_index: usize,
-    asst_idx: usize,
-    end_idx: usize,
-    messages: &[Message],
-    dir: &std::path::Path,
-) -> BitFunResult<std::path::PathBuf> {
-    let tool_calls: Vec<serde_json::Value> = match &messages[asst_idx].content {
-        MessageContent::Mixed { tool_calls, .. } => tool_calls
-            .iter()
-            .map(|tc| {
-                serde_json::json!({
-                    "tool_id":   tc.tool_id,
-                    "tool_name": tc.tool_name,
-                    "arguments": tc.arguments,
-                })
-            })
-            .collect(),
-        _ => vec![],
-    };
-
-    let tool_results: Vec<serde_json::Value> = messages[asst_idx + 1..end_idx]
-        .iter()
-        .filter_map(|m| match &m.content {
-            MessageContent::ToolResult {
-                tool_id,
-                tool_name,
-                result_for_assistant,
-                is_error,
-                ..
-            } => Some(serde_json::json!({
-                "tool_id":   tool_id,
-                "tool_name": tool_name,
-                "is_error":  is_error,
-                "content":   result_for_assistant.as_deref().unwrap_or(""),
-            })),
-            _ => None,
-        })
-        .collect();
-
-    let record = serde_json::json!({
-        "round_index":  round_index,
-        "tool_calls":   tool_calls,
-        "tool_results": tool_results,
-    });
-
-    tokio::fs::create_dir_all(dir)
-        .await
-        .map_err(|e| BitFunError::io(format!("lifecycle: create dir: {e}")))?;
-
-    let path = dir.join(format!(
-        "evicted_round_{}_{}.json",
-        round_index,
-        uuid::Uuid::new_v4()
-    ));
-    tokio::fs::write(&path, serde_json::to_string_pretty(&record)?)
-        .await
-        .map_err(|e| BitFunError::io(format!("lifecycle: write recovery file: {e}")))?;
-    Ok(path)
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agentic::core::message::ToolResult;
 
-    fn make_messages(tool_count: usize) -> Vec<Message> {
-        let mut msgs = vec![
-            Message::system("sys".to_string()),
-            Message::user("task".to_string()),
-        ];
-        let tool_calls: Vec<ToolCall> = (0..tool_count)
-            .map(|i| ToolCall {
-                tool_id: format!("id_{i}"),
-                tool_name: format!("Tool{i}"),
-                arguments: serde_json::json!({"file": format!("f{i}.rs")}),
-                ..Default::default()
-            })
-            .collect();
-        msgs.push(Message::assistant_with_tools(String::new(), tool_calls));
-        for i in 0..tool_count {
-            msgs.push(Message::tool_result(ToolResult {
-                tool_id: format!("id_{i}"),
-                tool_name: format!("Tool{i}"),
-                result: serde_json::json!({}),
-                result_for_assistant: Some(format!("result {i}")),
-                is_error: false,
-                duration_ms: None,
-                image_attachments: None,
-            }));
-        }
-        msgs
-    }
-
-    #[test]
-    fn record_captures_correct_indices() {
-        let msgs = make_messages(2);
-        let asst_idx = 2;
-        let mut mgr = LifecycleEvictionManager::new(3);
-        mgr.record_segment(&msgs, 0, asst_idx);
-
-        assert_eq!(mgr.segments.len(), 1);
-        let seg = &mgr.segments[0];
-        assert_eq!(seg.assistant_msg_idx, 2);
-        assert_eq!(seg.end_idx, 5); // sys + user + asst + 2 results
-        assert_eq!(seg.state, SegmentState::Active);
-        assert_eq!(seg.view.tool_calls.len(), 2);
-        assert_eq!(seg.view.results.len(), 2);
-    }
-
-    #[test]
-    fn intent_captured_from_assistant_text() {
-        // deepseek path: planning reasoning is inline in the assistant text.
-        let mut msgs = vec![
-            Message::system("sys".to_string()),
-            Message::user("task".to_string()),
-        ];
-        let tool_calls = vec![ToolCall {
-            tool_id: "id_0".to_string(),
-            tool_name: "Read".to_string(),
-            arguments: serde_json::json!({"file": "galaxy.py"}),
+    fn messages(turn: &str, persisted: bool, error: bool, pending: bool) -> Vec<Message> {
+        let mut calls = vec![ToolCall {
+            tool_id: format!("{turn}-read"),
+            tool_name: "Read".into(),
+            arguments: serde_json::json!({}),
             ..Default::default()
         }];
-        msgs.push(Message::assistant_with_tools(
-            "I will add --offline and thread it through 4 files.".to_string(),
-            tool_calls,
-        ));
-        msgs.push(Message::tool_result(ToolResult {
-            tool_id: "id_0".to_string(),
-            tool_name: "Read".to_string(),
+        if pending {
+            calls.push(ToolCall {
+                tool_id: format!("{turn}-todo"),
+                tool_name: "TodoWrite".into(),
+                arguments: serde_json::json!({"todos":[{"status":"in_progress"}]}),
+                ..Default::default()
+            });
+        }
+        vec![
+            Message::assistant_with_tools("inspect".into(), calls),
+            Message::tool_result(ToolResult {
+                tool_id: format!("{turn}-read"),
+                tool_name: "Read".into(),
+                result: serde_json::json!({}),
+                result_for_assistant: Some(if persisted {
+                    "Full output saved to: /tmp/out.json".into()
+                } else {
+                    "short".into()
+                }),
+                is_error: error,
+                duration_ms: None,
+                image_attachments: None,
+            }),
+        ]
+    }
+    fn delta(version: u64, task: &str, state: &str, evidence: &[&str]) -> String {
+        serde_json::json!({"baseVersion":version,"taskUpdates":[{"taskId":task,"lifecycle":state,"coveredTurnAbsIds":[],"completionEvidence":evidence,"unresolvedQuestions":[]}]}).to_string()
+    }
+
+    #[test]
+    fn records_only_declared_result_boundary() {
+        let mut ms = messages("one", true, false, false);
+        ms.push(Message::tool_result(ToolResult {
+            tool_id: "future".into(),
+            tool_name: "Read".into(),
             result: serde_json::json!({}),
-            result_for_assistant: Some("file contents".to_string()),
-            is_error: false,
+            result_for_assistant: Some("Full output saved to: /tmp/future".into()),
+            is_error: true,
             duration_ms: None,
             image_attachments: None,
         }));
-
-        let mut mgr = LifecycleEvictionManager::new(3);
-        mgr.record_segment(&msgs, 0, 2);
-        assert_eq!(mgr.segments.len(), 1);
-        assert!(
-            mgr.segments[0].view.intent.contains("--offline"),
-            "intent should capture the assistant's planning text, got: {:?}",
-            mgr.segments[0].view.intent
+        let mut r = LifecycleRegistry::default();
+        let task = r.begin_turn("one", 0, "x".into());
+        r.record_segment(&ms, 0, 2, "one", 0, &task);
+        let s = r.segments.values().next().unwrap();
+        assert!(!s.has_error);
+        assert_eq!(s.artifact_handles, vec!["/tmp/out.json"]);
+    }
+    #[test]
+    fn estimator_can_merge_turns_into_one_task() {
+        let mut r = LifecycleRegistry::default();
+        let first = r.begin_turn("one", 0, "x".into());
+        r.record_segment(&messages("one", true, false, false), 0, 2, "one", 0, &first);
+        let provisional = r.begin_turn("two", 1, "y".into());
+        r.record_segment(
+            &messages("two", true, false, false),
+            0,
+            2,
+            "two",
+            1,
+            &provisional,
         );
+        let update = serde_json::json!({"baseVersion":0,"taskUpdates":[{"taskId":first,"lifecycle":"active","coveredTurnAbsIds":["one","two"],"completionEvidence":[],"unresolvedQuestions":[]}]}).to_string();
+        r.apply_delta(&update, &provisional, 1).unwrap();
+        assert!(!r.tasks.contains_key(&provisional));
+        assert_eq!(r.tasks[&first].covered_turn_ids, vec!["one", "two"]);
+        assert!(r
+            .segments
+            .values()
+            .all(|s| s.task_ids == vec![first.clone()]));
     }
-
     #[test]
-    fn text_only_round_not_recorded() {
-        let msgs = vec![
-            Message::system("sys".to_string()),
-            Message::user("task".to_string()),
-            Message::assistant("just text".to_string()),
-        ];
-        let mut mgr = LifecycleEvictionManager::new(3);
-        mgr.record_segment(&msgs, 0, 2);
-        assert!(mgr.segments.is_empty());
+    fn rejects_stale_evidence_free_completion_and_direct_eviction() {
+        let mut r = LifecycleRegistry::default();
+        let task = r.begin_turn("one", 0, "x".into());
+        assert!(r
+            .apply_delta(&delta(1, &task, "completed", &["done"]), &task, 0)
+            .is_err());
+        r.apply_delta(&delta(0, &task, "completed", &[]), &task, 0)
+            .unwrap();
+        assert_eq!(r.tasks[&task].state, LifecycleTaskState::Active);
+        r.apply_delta(&delta(1, &task, "evictable", &["done"]), "other-task", 3)
+            .unwrap();
+        assert_eq!(r.tasks[&task].state, LifecycleTaskState::Active);
     }
-
     #[test]
-    fn should_run_at_batch_boundaries() {
-        let msgs = make_messages(1);
-        let mut mgr = LifecycleEvictionManager::new(3);
-        mgr.record_segment(&msgs, 0, 2);
-
-        assert!(!mgr.should_run_estimator(0));
-        assert!(!mgr.should_run_estimator(1));
-        assert!(mgr.should_run_estimator(2));
-        assert!(!mgr.should_run_estimator(3));
-        assert!(mgr.should_run_estimator(5));
+    fn candidate_requires_old_persisted_safe_segment_and_evidence() {
+        let mut r = LifecycleRegistry::default();
+        let old = r.begin_turn("one", 0, "x".into());
+        r.record_segment(&messages("one", true, false, false), 0, 2, "one", 0, &old);
+        let current = r.begin_turn("four", 3, "y".into());
+        r.apply_delta(&delta(0, &old, "completed", &["done"]), &current, 3)
+            .unwrap();
+        r.apply_delta(&delta(1, &old, "evictable", &["done"]), &current, 3)
+            .unwrap();
+        assert_eq!(r.candidate_task_ids(&current, 3), vec![old]);
     }
-
     #[test]
-    fn state_only_upgrades() {
-        let msgs = make_messages(1);
-        let mut mgr = LifecycleEvictionManager::new(3);
-        mgr.record_segment(&msgs, 0, 2);
-        mgr.segments[0].state = SegmentState::Completed;
-
-        mgr.apply_state_updates([(0, SegmentState::Active)].into());
-        assert_eq!(mgr.segments[0].state, SegmentState::Completed);
-
-        mgr.apply_state_updates([(0, SegmentState::Evictable)].into());
-        assert_eq!(mgr.segments[0].state, SegmentState::Evictable);
-    }
-
-    #[test]
-    fn error_segment_protected_from_eviction() {
-        let msgs = make_messages(1);
-        let mut mgr = LifecycleEvictionManager::new(3);
-        mgr.record_segment(&msgs, 0, 2);
-        mgr.segments[0].view.results[0].is_error = true;
-
-        mgr.apply_state_updates([(0, SegmentState::Evictable)].into());
-        assert_eq!(mgr.segments[0].state, SegmentState::Active);
-    }
-
-    #[tokio::test]
-    async fn reindex_correct_after_eviction() {
-        // Layout: [sys(0), user(1), asst0(2), r00(3), r01(4), asst1(5), r10(6), r11(7), r12(8), asst2(9), r20(10)]
-        // Seg0: asst=2 end=5 (2 results)   → Evictable
-        // Seg1: asst=5 end=9 (3 results)   → Evictable
-        // Seg2: asst=9 end=11 (1 result)   → Active
-        let mut msgs = vec![
-            Message::system("sys".into()),
-            Message::user("task".into()),
-        ];
-        for round in 0..3usize {
-            let count = match round {
-                1 => 3,
-                2 => 1,
-                _ => 2,
-            };
-            let calls: Vec<ToolCall> = (0..count)
-                .map(|i| ToolCall {
-                    tool_id: format!("id_r{round}_{i}"),
-                    tool_name: "Tool".into(),
-                    arguments: serde_json::json!({}),
-                    ..Default::default()
-                })
-                .collect();
-            msgs.push(Message::assistant_with_tools(String::new(), calls));
-            for i in 0..count {
-                msgs.push(Message::tool_result(ToolResult {
-                    tool_id: format!("id_r{round}_{i}"),
-                    tool_name: "Tool".into(),
-                    result: serde_json::json!({}),
-                    result_for_assistant: Some("result".into()),
-                    is_error: false,
-                    duration_ms: None,
-                    image_attachments: None,
-                }));
-            }
+    fn candidate_rejects_missing_artifact_errors_pending_and_recent() {
+        for (persisted, error, pending, turn) in [
+            (false, false, false, 3),
+            (true, true, false, 3),
+            (true, false, true, 3),
+            (true, false, false, 1),
+        ] {
+            let mut r = LifecycleRegistry::default();
+            let old = r.begin_turn("one", 0, "x".into());
+            r.record_segment(
+                &messages("one", persisted, error, pending),
+                0,
+                2,
+                "one",
+                0,
+                &old,
+            );
+            let current = r.begin_turn("now", turn, "y".into());
+            r.apply_delta(&delta(0, &old, "completed", &["done"]), &current, turn)
+                .unwrap();
+            r.apply_delta(&delta(1, &old, "evictable", &["done"]), &current, turn)
+                .unwrap();
+            assert!(r.candidate_task_ids(&current, turn).is_empty());
         }
-
-        let empty_view =
-            |idx| SegmentView { round_index: idx, intent: String::new(), tool_calls: vec![], results: vec![] };
-
-        let mut mgr = LifecycleEvictionManager::new(3);
-        mgr.segments = vec![
-            ContextSegment {
-                round_index: 0,
-                assistant_msg_idx: 2,
-                end_idx: 5,
-                state: SegmentState::Evictable,
-                view: empty_view(0),
-            },
-            ContextSegment {
-                round_index: 1,
-                assistant_msg_idx: 5,
-                end_idx: 9,
-                state: SegmentState::Evictable,
-                view: empty_view(1),
-            },
-            ContextSegment {
-                round_index: 2,
-                assistant_msg_idx: 9,
-                end_idx: 11,
-                state: SegmentState::Active,
-                view: empty_view(2),
-            },
-        ];
-
-        mgr.execute_eviction(&mut msgs, None).await.unwrap();
-
-        assert_eq!(mgr.segments.len(), 1);
-        let seg = &mgr.segments[0];
-        assert_eq!(seg.round_index, 2);
-        // shift from Seg0: 1-(5-2)=-2; from Seg1: 1-(9-5)=-3; total=-5
-        assert_eq!(seg.assistant_msg_idx, 4); // 9 - 5
-        assert_eq!(seg.end_idx, 6);           // 11 - 5
-        // Evict Seg1 [5,9): drain 4 + insert 1 → 8 msgs
-        // Evict Seg0 [2,5): drain 3 + insert 1 → 6 msgs
-        assert_eq!(msgs.len(), 6);
+    }
+    #[test]
+    fn batch_is_explicit_and_never_divides_by_zero() {
+        let mut r = LifecycleRegistry::default();
+        assert!(!r.should_estimate(2, 0));
+        let task = r.begin_turn("one", 0, "x".into());
+        r.record_segment(&messages("one", true, false, false), 0, 2, "one", 0, &task);
+        assert!(r.should_estimate(2, 3));
+        assert!(!r.should_estimate(1, 3));
     }
 }

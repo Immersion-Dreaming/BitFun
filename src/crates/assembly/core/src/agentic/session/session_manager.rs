@@ -131,6 +131,10 @@ pub struct SessionManager {
     /// be cleared when a session is explicitly deleted.
     session_storage_path_index: Arc<DashMap<String, PathBuf>>,
 
+    /// Runtime mirror for session metadata that must survive dialog-turn
+    /// boundaries even when persistence is disabled (for example in tests).
+    runtime_metadata_store: Arc<DashMap<String, serde_json::Value>>,
+
     /// Sub-components
     context_store: Arc<SessionContextStore>,
     prompt_cache_store: Arc<SessionPromptCacheStore>,
@@ -1232,6 +1236,7 @@ impl SessionManager {
         let manager = Self {
             sessions: Arc::new(DashMap::new()),
             session_storage_path_index: Arc::new(DashMap::new()),
+            runtime_metadata_store: Arc::new(DashMap::new()),
             context_store,
             prompt_cache_store: Arc::new(SessionPromptCacheStore::new()),
             token_anchor_store: Arc::new(TokenAnchorStore::new()),
@@ -1423,6 +1428,7 @@ impl SessionManager {
     fn spawn_model_reconciliation_listener(&self) {
         let sessions = self.sessions.clone();
         let session_storage_path_index = self.session_storage_path_index.clone();
+        let runtime_metadata_store = self.runtime_metadata_store.clone();
         let context_store = self.context_store.clone();
         let prompt_cache_store = self.prompt_cache_store.clone();
         let token_anchor_store = self.token_anchor_store.clone();
@@ -1449,6 +1455,7 @@ impl SessionManager {
             let manager = Self {
                 sessions,
                 session_storage_path_index,
+                runtime_metadata_store,
                 context_store,
                 prompt_cache_store,
                 token_anchor_store,
@@ -3990,6 +3997,65 @@ impl SessionManager {
             merge_session_custom_metadata_value(metadata, patch)
         })
         .await
+    }
+
+    /// Load a named session-scoped metadata value. The in-memory mirror keeps
+    /// lifecycle state available between dialog turns; persisted metadata makes
+    /// it survive process restart.
+    pub async fn load_session_runtime_metadata(
+        &self,
+        session_id: &str,
+        key: &str,
+    ) -> BitFunResult<Option<serde_json::Value>> {
+        if let Some(metadata) = self.runtime_metadata_store.get(session_id) {
+            if let Some(value) = metadata.get(key) {
+                return Ok(Some(value.clone()));
+            }
+        }
+
+        if !self.should_persist_session_id(session_id) {
+            return Ok(None);
+        }
+
+        let workspace_path = self.metadata_workspace_path_for_update(session_id).await?;
+        let value = self
+            .persistence_manager
+            .load_session_metadata(&workspace_path, session_id)
+            .await?
+            .and_then(|metadata| metadata.custom_metadata)
+            .and_then(|metadata| metadata.get(key).cloned());
+
+        if let Some(value) = value.as_ref() {
+            self.runtime_metadata_store
+                .entry(session_id.to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .expect("runtime metadata is always an object")
+                .insert(key.to_string(), value.clone());
+        }
+        Ok(value)
+    }
+
+    /// Save a named session-scoped metadata value to the runtime mirror and,
+    /// when available, to the normal session metadata sidecar.
+    pub async fn save_session_runtime_metadata(
+        &self,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> BitFunResult<()> {
+        self.runtime_metadata_store
+            .entry(session_id.to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .expect("runtime metadata is always an object")
+            .insert(key.to_string(), value.clone());
+
+        if self.should_persist_session_id(session_id) {
+            self.merge_session_custom_metadata(session_id, json!({ key: value }))
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn merge_session_relationship(

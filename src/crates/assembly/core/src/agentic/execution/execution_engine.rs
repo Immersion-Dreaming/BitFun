@@ -2756,41 +2756,82 @@ impl ExecutionEngine {
         let mut thinking_only_rescue_attempts: usize = 0;
         let mut partial_continuation_attempts: usize = 0;
 
-        // ── Lifecycle-Aware Eviction (Hook 1) ────────────────────────────────
-        // Initialise the manager and extract the task context once before the
-        // round loop starts.  Both are reused across all rounds in this turn.
-        let lifecycle_batch_size = session
-            .config
-            .lifecycle_eviction_batch_size
-            .unwrap_or(super::lifecycle_evict::LIFECYCLE_BATCH_SIZE);
-        let mut lifecycle_eviction_manager =
-            super::lifecycle_evict::LifecycleEvictionManager::new(lifecycle_batch_size);
+        // ── Lifecycle-Aware Eviction (shadow mode, Steps 1-2) ───────────────
+        // Physical message eviction is intentionally disabled until the
+        // persistent registry and candidate gate have passed regression tests.
+        // An explicit positive batch size enables registry tracking.
+        let lifecycle_batch_size = match session.config.lifecycle_eviction_batch_size {
+            Some(0) => {
+                warn!("lifecycle eviction disabled: batch size must be greater than zero");
+                None
+            }
+            value => value,
+        };
+        let mut lifecycle_registry = if lifecycle_batch_size.is_some() {
+            match self
+                .session_manager
+                .load_session_runtime_metadata(
+                    &context.session_id,
+                    super::lifecycle_evict::LIFECYCLE_REGISTRY_METADATA_KEY,
+                )
+                .await
+            {
+                Ok(Some(value)) => {
+                    match serde_json::from_value(value) {
+                        Ok(registry) => Some(registry),
+                        Err(error) => {
+                            warn!("lifecycle registry decode failed; starting empty shadow registry: {}", error);
+                            Some(super::lifecycle_evict::LifecycleRegistry::default())
+                        }
+                    }
+                }
+                Ok(None) => Some(super::lifecycle_evict::LifecycleRegistry::default()),
+                Err(error) => {
+                    warn!(
+                        "lifecycle registry load failed; shadow mode disabled for this turn: {}",
+                        error
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
-        // First ActualUserInput in the message list; fall back to the last user
-        // message so the context string is never empty.
+        // Use this dialog turn's user message. Looking up the first historical
+        // ActualUserInput made the old estimator reason about stale objectives.
         let lifecycle_task_context: String = messages
             .iter()
+            .rev()
             .find(|m| {
                 matches!(
                     m.metadata.semantic_kind,
                     Some(crate::agentic::core::MessageSemanticKind::ActualUserInput)
-                )
+                ) && m.metadata.turn_id.as_deref() == Some(context.dialog_turn_id.as_str())
             })
-            .or_else(|| messages.iter().rev().find(|m| m.role == crate::agentic::core::MessageRole::User))
+            .or_else(|| {
+                messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == crate::agentic::core::MessageRole::User)
+            })
             .map(|m| match &m.content {
-                crate::agentic::core::MessageContent::Text(t) =>
-                    super::lifecycle_evict::truncate_chars(t, 500),
-                crate::agentic::core::MessageContent::Multimodal { text, .. } =>
-                    super::lifecycle_evict::truncate_chars(text, 500),
+                crate::agentic::core::MessageContent::Text(t) => {
+                    super::lifecycle_evict::truncate_chars(t, 500)
+                }
+                crate::agentic::core::MessageContent::Multimodal { text, .. } => {
+                    super::lifecycle_evict::truncate_chars(text, 500)
+                }
                 _ => String::new(),
             })
             .unwrap_or_default();
-
-        // Recovery files land next to regular tool-result persisted outputs.
-        let lifecycle_tool_results_dir: Option<std::path::PathBuf> = context
-            .workspace
-            .as_ref()
-            .map(|ws| ws.session_storage_dir().join(&context.session_id).join("tool-results"));
+        let lifecycle_task_id = lifecycle_registry.as_mut().map(|registry| {
+            registry.begin_turn(
+                &context.dialog_turn_id,
+                context.turn_index,
+                lifecycle_task_context.clone(),
+            )
+        });
         // ─────────────────────────────────────────────────────────────────────
 
         // Add detailed logging showing the execution context messages.
@@ -3037,9 +3078,8 @@ impl ExecutionEngine {
                         full_compression_count += 1;
                         consecutive_compression_failures = 0;
                         send_pressure_reusable = false;
-                        // ── Hook 4: full compression replaced messages; all stored
-                        // segment indices are stale — reset the lifecycle registry.
-                        lifecycle_eviction_manager.reset_after_compression();
+                        // The persistent lifecycle registry uses stable turn/tool IDs,
+                        // so it deliberately survives a context rewrite in shadow mode.
                     }
                     Ok(None) => {
                         debug!("No eligible multi-turn context available for compression");
@@ -3094,9 +3134,7 @@ impl ExecutionEngine {
                 self.session_manager
                     .prune_token_anchors_to_messages(&context.session_id, &messages)
                     .await;
-                // ── Hook 5: emergency truncation physically deleted messages;
-                // stored segment indices are stale — reset just like Hook 4.
-                lifecycle_eviction_manager.reset_after_compression();
+                // The persistent lifecycle registry stores no message indices.
                 send_pressure = Self::estimate_auto_compression_pressure(
                     &messages,
                     tool_definitions.as_deref(),
@@ -3265,52 +3303,25 @@ impl ExecutionEngine {
                 }
             }
 
-            // ── Hook 2b: record segment after all tool results are pushed ────────
-            lifecycle_eviction_manager.record_segment(
-                &messages,
-                round_index,
-                lifecycle_assistant_msg_idx,
-            );
+            // Record the completed tool round into the persistent shadow registry.
+            if let (Some(registry), Some(task_id)) =
+                (lifecycle_registry.as_mut(), lifecycle_task_id.as_deref())
+            {
+                registry.record_segment(
+                    &messages,
+                    lifecycle_assistant_msg_idx,
+                    messages.len(),
+                    &context.dialog_turn_id,
+                    context.turn_index,
+                    task_id,
+                );
+            }
 
             debug!(
                 "Updated round messages in memory: round_index={}, assistant + {} tool results",
                 round_index,
                 round_result.tool_result_messages.len()
             );
-
-            // ── Hook 3: batch eviction at every B-th round ───────────────────────
-            if lifecycle_eviction_manager.should_run_estimator(round_index) {
-                let evicted = lifecycle_eviction_manager
-                    .run_batch_eviction(
-                        &mut messages,
-                        round_index,
-                        &lifecycle_task_context,
-                        lifecycle_tool_results_dir.as_deref(),
-                    )
-                    .await
-                    .unwrap_or_else(|e| {
-                        warn!("lifecycle eviction error (skipping): {}", e);
-                        0
-                    });
-
-                if evicted > 0 {
-                    self.session_manager
-                        .replace_context_messages(&context.session_id, messages.clone())
-                        .await;
-                    self.session_manager
-                        .invalidate_prompt_cache(
-                            &context.session_id,
-                            crate::agentic::session::PromptCacheScope::All,
-                            "lifecycle_eviction_applied",
-                        )
-                        .await;
-                    debug!(
-                        "Lifecycle eviction sync: session={}, evicted={}, messages_len={}",
-                        context.session_id, evicted, messages.len()
-                    );
-                }
-            }
-            // ─────────────────────────────────────────────────────────────────────
 
             total_tools += round_result.tool_calls.len();
 
@@ -3884,6 +3895,58 @@ impl ExecutionEngine {
             );
         } else {
             warn!("Dialog turn completed but token stats not available");
+        }
+
+        // Estimate only after a complete user turn. This deliberately updates
+        // registry state only: Steps 1-2 must never rewrite model-visible context.
+        if let (Some(registry), Some(batch_size), Some(task_id)) = (
+            lifecycle_registry.as_mut(),
+            lifecycle_batch_size,
+            lifecycle_task_id.as_deref(),
+        ) {
+            if registry.should_estimate(context.turn_index, batch_size) {
+                match registry.build_vi(task_id, &context.dialog_turn_id, context.turn_index) {
+                    Ok(vi_json) => {
+                        match super::lifecycle_evict::estimate_registry_delta(vi_json).await {
+                            Ok(response) => {
+                                if let Err(error) =
+                                    registry.apply_delta(&response, task_id, context.turn_index)
+                                {
+                                    warn!("lifecycle shadow delta rejected: {}", error);
+                                }
+                            }
+                            Err(error) => warn!(
+                                "lifecycle shadow estimator failed; registry unchanged: {}",
+                                error
+                            ),
+                        }
+                    }
+                    Err(error) => warn!("lifecycle shadow Vi build failed: {}", error),
+                }
+            }
+
+            let candidate_count = registry
+                .candidate_task_ids(task_id, context.turn_index)
+                .len();
+            match serde_json::to_value(&*registry) {
+                Ok(value) => {
+                    if let Err(error) = self
+                        .session_manager
+                        .save_session_runtime_metadata(
+                            &context.session_id,
+                            super::lifecycle_evict::LIFECYCLE_REGISTRY_METADATA_KEY,
+                            value,
+                        )
+                        .await
+                    {
+                        warn!("lifecycle shadow registry save failed: {}", error);
+                    } else {
+                        info!("lifecycle shadow registry saved: session={}, version={}, tasks={}, segments={}, candidates={}",
+                            context.session_id, registry.version, registry.tasks.len(), registry.segments.len(), candidate_count);
+                    }
+                }
+                Err(error) => warn!("lifecycle shadow registry serialization failed: {}", error),
+            }
         }
 
         // Calculate newly generated messages

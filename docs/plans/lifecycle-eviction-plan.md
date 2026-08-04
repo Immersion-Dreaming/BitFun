@@ -5,12 +5,12 @@
 | # | 任务 | 状态 | 备注 |
 |---|------|------|------|
 | 1 | `message.rs` +1 variant +1 match arm | ✅ 完成 | Section 一 |
-| 2 | 新建 `lifecycle_evict.rs` | ✅ 完成 | Section 二（~350行） |
+| 2 | 新建 `lifecycle_evict.rs` | 🟡 原型完成 | 代码存在，但仍是单 dialog-turn 的 segment 管理器，不满足论文的跨 session lifecycle 语义；见 Section 九 |
 | 3 | `execution/mod.rs` +1行 mod 声明 | ✅ 完成 | Section 四 |
-| 4 | `execution_engine.rs` Hook 1-5 | ✅ 完成 | Section 三 |
-| 5 | `SessionConfig` 新增 `lifecycle_eviction_batch_size` | ✅ 完成 | `agent-runtime/src/session.rs` |
-| 6 | `cargo build` 无错误 | ✅ 完成 | |
-| 7 | `cargo test lifecycle` — 6个新测试通过 | ✅ 完成 | 11/11 通过 |
+| 4 | `execution_engine.rs` Hook 1-5 | 🟡 原型接线完成 | 物理驱逐已接入，但当前不具备生产启用条件；见 Section 九 |
+| 5 | `SessionConfig` 新增 `lifecycle_eviction_batch_size` | 🟡 完成但缺少校验 | `Some(0)` 会在取模时 panic；见 Section 九 |
+| 6 | 构建验证 | ✅ `cargo test -p bitfun-core lifecycle_evict --lib` 通过 | 7 个模块单测通过；未确认整个 workspace `cargo test lifecycle` 的 11/11 声明 |
+| 7 | lifecycle 集成/回归测试 | ❌ 未完成 | 缺跨 turn、恢复失败、cache 成本、任务质量的自动化验证 |
 
 > **分支**：`feat/lifecycle-eviction`（从 `main` 创建）
 
@@ -1075,9 +1075,9 @@ guard 拦截次数（error 段被误判 evictable、被 `apply_state_updates` �
 排序依据：**不要在"刚被证明不可靠的 estimator"上加注**，优先确定性代码护栏。
 
 **P0 — 代码层硬护栏（确定性、可单测、直接堵住 a02e22 类灾难）**
-- 含 `Edit`/`Write`/`MultiEdit` 的段 → 强制不可驱逐（`apply_state_updates` 内拦截，与现有 error 护栏并列）。
-- 未完成 TodoWrite（有 in_progress/pending）的段 → 强制不可驱逐。
-- 保留最近 N 轮强制 Active（`current_round - round_index < N`）。
+- 作为当前原型的临时止血：含 error、未完成 TodoWrite、当前任务、最近 N 个 segment 的内容不得驱逐。
+- 不将 `Edit`/`Write` 永久标成不可驱逐：它们是完成证据的一部分；任务完成、交付已验证且已切换到新任务后，旧写入段可以在 artifact 可恢复的前提下驱逐。
+- 根本修复见 Section 九：先建立跨 turn 的 task registry，再让确定性任务状态决定候选集；不能仅靠工具名护栏。
 
 **P0 — estimator I/O 结构化落盘**
 - 已加 debug 日志（Vi/reasoning/raw text/parsed decision，见 commit 待补）。
@@ -1096,3 +1096,161 @@ guard 拦截次数（error 段被误判 evictable、被 `apply_state_updates` �
 **未决（需你拍板）**：是否给 lifecycle eviction 加"仅在接近压缩阈值时才启动"的开关——
 a26c32/5f4e33 峰值 usage 都远低于阈值（<30%），此时激进驱逐纯属亏本；
 eviction 的价值本应体现在"逼近 context 上限、否则要走有损压缩"的场景。
+
+---
+
+## 九、v3 生命周期层复现审核与修复计划（2026-08-04）
+
+### 9.1 范围与结论
+
+本节只处理 TokenPilot 的 **Local Lifecycle-Aware Eviction**：
+`active -> completed -> evictable`、批量状态估计、保守物理驱逐和 cache 代价摊销。
+论文的 Ingestion-Aware Compaction 由其他分支负责；本分支只复用其已经存在的
+artifact/recovery 基础设施，不重复实现 ingestion 策略。
+
+**结论：当前分支完成了一个可运行的单 dialog-turn 原型，但没有复现论文要求的
+跨 session 任务生命周期。当前物理 eviction 不应默认启用。** 8.3/8.4 的真实 A/B
+已经证明，它会造成任务计划丢失、重复读取和 cache 负收益；这些不是单纯调 prompt
+或增大 batch size 可以解决的问题。
+
+论文的最小语义是：
+
+```text
+session task registry (persistent)
+    active --[verified completion evidence]--> completed
+    completed --[no residual dependency + session moved on]--> evictable
+    evictable --[validated recovery handle + economic gate]--> physical removal
+```
+
+`completed` 是缓存保留状态，不是删除命令；`B=3` 是把一次已确认的历史改写
+摊销到多个后续请求的调度参数，不是 registry 的生命周期范围。
+
+### 9.2 已确认问题、影响与修复原则
+
+| ID | 当前事实 | 为什么偏离论文/导致回归 | 修复方法 | 优先级/进度 |
+|---|---|---|---|---|
+| L1 | `LifecycleEvictionManager` 在每次 `execute_dialog_turn_impl` 内新建，函数返回即丢失；只登记本 turn 的 tool round | 旧 context 虽会传入下一 turn，但没有被登记。真实 session 中常见的“一 turn 1-2 个工具 round”永远不触发，且无法根据新任务使旧任务过期 | 已改为 session metadata 中的 `LifecycleRegistry`，按稳定 turn/tool-call ID 记录；不保存 `Vec<Message>` 下标 | P0，Step 1 已完成 |
+| L2 | 单位是 `round_index`，不是任务；Vi 只有当前任务字符串和局部 tool preview | 无法表示“同一任务跨多 turn”、新用户请求切换任务、完成证据、未决问题与跨任务残余依赖。a02e22 的计划/探索 Read 段被删正是此缺口 | 已引入 `TaskRecord`/`SegmentRecord`；delta 带 `baseVersion`，并校验 task/turn ID、证据、单调状态及 `completed -> evictable` 前驱 | P0，Step 1-2 已完成 |
+| L3 | 近期轮、当前任务、Todo、planning intent 只在 prompt 中软约束；代码只硬拦 error | estimator 已在 a26c32 多次把 error 判为可删；同样会删除尚在执行的 Read/计划段，导致忘记待改文件和重复读 | 已实现确定性 candidate gate：当前任务、最近 N、error、pending Todo、无 artifact 及未完成证据者均不产生候选 | P0，Step 2 已完成 |
+| L4 | `lifecycle_task_context` 正向找第一条 `ActualUserInput` | 多 turn session 中它往往是最早任务，estimator 使用过期目标判断当前段 | 已用 `dialog_turn_id` 找本 turn user input；缺 metadata 才回退到最后 user message | P0，已完成 |
+| L5 | recovery JSON 写 `result_for_assistant`，写失败仍继续 drain | 已 persisted 的大结果此字段只是 preview/引用；失败时 summary 仍删除消息，所谓“Full content”并不可靠 | 使用已有 immutable artifact handle；未持久化结果先原子保存完整 payload。无可验证 handle 或落盘失败则本批不驱逐 | P0，未开始 |
+| L6 | 任一 eviction 都 `replace_context_messages` + `PromptCacheScope::All`，还清空 file-read state | 一次中段改写会重建 provider cache；8.4 已证明频繁驱逐可能成本更高、重复读更多。API 无法保留任意中段删除后的后缀 KV | 驱逐前使用 provider usage 和 token estimate 计算收益；仅在接近压缩压力且预期后续复用足以回本时执行；一次 batch 最多一次重写 | P1，未开始 |
+| L7 | `lifecycle_eviction_batch_size: Option<usize>` 未限制，`% batch_size` 直接执行 | 恢复的 session/config 传入 0 会 panic | 配置解析和 `LifecycleEvictionManager::new` 双重拒绝/钳制 0；补回归测试 | P0，未开始 |
+| L8 | Vi、reasoning、raw estimator response 仅 debug 日志；当前测试只测内存重排 | 无法回放错误驱逐，无法量化误判、恢复和 cache 代价；7 个单测不覆盖实际风险 | 将每 batch 的输入摘要、delta、硬护栏拒绝原因、token 账目写可审计 session artifact；增加集成测试矩阵 | P1，未开始 |
+
+### 9.3 目标数据模型：仅为 lifecycle 层新增 session 状态
+
+不在本分支实现论文第一层的 preview/HTML/格式清洗；只消费 BitFun 已有的
+`tool_result_storage` artifact。新增的生命周期状态建议放在 session manager 的持久化
+metadata/sidecar 中：
+
+```rust
+struct LifecycleRegistry {
+    version: u64,
+    last_processed_turn_seq: u64,
+    tasks: BTreeMap<TaskId, TaskRecord>,
+    segments: BTreeMap<SegmentId, SegmentRecord>,
+}
+
+struct TaskRecord {
+    id: TaskId,
+    objective: String,
+    lifecycle: Active | Blocked | Completed | Evictable,
+    covered_turn_ids: Vec<String>,
+    completion_evidence: Vec<Evidence>,
+    unresolved_questions: Vec<String>,
+    segment_ids: Vec<SegmentId>,
+    last_touched_turn_seq: u64,
+}
+
+struct SegmentRecord {
+    id: SegmentId,
+    turn_id: String,
+    tool_call_ids: Vec<String>,
+    task_ids: Vec<TaskId>,
+    artifact_handles: Vec<ArtifactHandle>,
+    flags: SegmentFlags,
+    token_estimate: usize,
+    residency: Resident | Candidate | Evicted,
+}
+```
+
+`SegmentId` 由 turn ID 加 assistant tool-call IDs 派生。物理范围在执行时通过这些
+稳定 ID 从当前 messages 重新定位；压缩、恢复、插入 reminder 后不复用旧 index。
+
+### 9.4 实施顺序与完成定义
+
+#### Step 0 - 先止血，避免继续产生错误实验数据
+
+- feature flag 默认关闭当前 physical eviction；保留日志和现有 A/B 工具。
+- 加 L7 的非零 batch 校验。
+- 加临时硬护栏：error、pending Todo、最近 N 个 segment、当前 dialog turn 不驱逐。
+- **完成条件**：故意让 estimator 输出最新/error/pending segment 为 `evictable` 时，
+  context byte-for-byte 不变，并记录拒绝原因。
+
+#### Step 1 - 持久化 registry，先做 shadow mode
+
+- 在 session manager 中 load/save `LifecycleRegistry`；session restore 后保持版本和状态。
+- 每个完成的 tool round 生成 `SegmentRecord`，关联真实 `dialog_turn_id` 和 tool IDs。
+- 每 B 个 **user turn**（不是本地 round）调用 estimator；输入为增量 turn 摘要、
+  active/completed task 摘要和候选 task ID，而不是整段历史。
+- estimator 输出 task delta；只更新 registry，绝不改 messages。
+- **完成条件**：三次不同 user turn 能产生并恢复同一个 task；切换到新任务后旧 task
+  可从 completed 进入 candidate；重启 session 后 registry 等价。
+
+#### Step 2 - 建立可验证的 candidate gate
+
+候选 segment 必须同时满足：所属 task 已 completed、没有 unresolved question、
+不属于当前任务或保护尾部、没有 error/pending Todo、所有原始输出已有可读 artifact。
+`Edit`/`Write` 是 completion evidence，不是永久 pin；只有任务仍 active/blocked 时才保护。
+
+- 用 deterministic evidence（成功写入、测试通过、用户确认、任务切换）补强 estimator。
+- delta 的 `base_version`、task/turn ID、状态跃迁和证据字段全部由程序验证。
+- **完成条件**：复现 a02e22 的四文件任务时，尚未完成的计划/Read/Write 证据均不能成为
+  candidate；只有交付完成且切换到另一任务的 segment 才出现 candidate。
+
+#### Step 3 - 原子物理驱逐与恢复
+
+- 对候选集先验证 artifact handles；若任何一个不可读，整个 batch 不驱逐。
+- summary 只保存 task ID、驱逐理由和现有 artifact handle；不再把 preview 伪装成 full content。
+- 成功替换后一次性刷新 session context，并记录被删 token、最早修改位置、cache reset 原因。
+- **完成条件**：注入磁盘写失败、artifact 缺失、取消、压缩/恢复后重启等故障时，均不会出现
+  “消息被删除但无法恢复”；原子性失败必须保持原 messages。
+
+#### Step 4 - 经济调度和正式启用
+
+只在以下条件同时成立时允许 Step 3：接近 BitFun 的压缩压力、预计 freed tokens 达到
+最小阈值、预期复用 horizon 足以支付一次 cache miss、估算器成本不超过收益预算。
+
+记录每 batch：provider cache-hit/cache-miss/input/output tokens、estimator tokens/延迟、
+被删 token、恢复次数、重复工具调用、任务质量、P95 延迟。以原有 main 和 lifecycle
+shadow mode 做同一模型/同一任务/多次运行的对照；不以单次 token 降幅作为启用依据。
+
+### 9.5 必须新增的自动化测试
+
+| 类别 | 最小用例 |
+|---|---|
+| 配置 | `batch_size=0` 不 panic；默认值和显式值可预测 |
+| 跨 turn | 1 个任务跨 3 turn，随后切换任务；registry 能恢复并只评估旧 completed task |
+| 状态机 | 无证据不能 `completed -> evictable`；版本冲突/未知 ID/回退状态被拒绝 |
+| 硬护栏 | current task、最近 N、error、pending Todo、无 artifact 的 segment 永不驱逐 |
+| 恢复 | persisted 和非 persisted tool result 均能读取完整 artifact；任一保存失败时原 messages 不变 |
+| 索引 | 多 segment 批量删除、全量压缩、emergency truncate、session restore 后均重新定位正确 |
+| 成本 | 未到 token-pressure 或收益不足时只更新 registry，不触发 context replace/cache invalidation |
+| 回归 | a02e22 型多文件计划任务不得丢失待修改文件；重复 Read 数和任务成功率必须记录 |
+
+### 9.6 当前进度快照
+
+| 阶段 | 状态 | 说明 |
+|---|---|---|
+| 现有单 turn 原型 | 🟡 已实现，默认不应视为完成 | 有 state enum、batch estimator、drain/reindex；不具备论文 session 语义 |
+| Step 0 | ✅ 已完成 | 默认关闭；`batch_size=0` 禁用且不会除零；没有物理改写路径 |
+| Step 1 shadow registry | ✅ 已完成 | session metadata 持久化，跨 turn task/segment registry，batch 按 user turn |
+| Step 2 candidate gate | ✅ 已完成 | 版本、ownership、证据、状态前驱、当前/近期/error/Todo/artifact 均由程序硬校验 |
+| Step 3 physical eviction | ❌ 未实施 | 用其替代当前直接 drain 路径 |
+| Step 4 economy gate | ❌ 未实施 | 以 telemetry 决定是否真正启用 |
+
+**Step 1-2 验证（2026-08-04）**：`cargo test -p bitfun-core lifecycle_evict --lib -- --nocapture`
+通过 6/6。覆盖 batch=0、跨 turn task 合并、过期版本、无完成证据、禁止
+`active -> evictable` 直跳、单轮 result 边界，以及 current/recent/error/pending Todo/
+缺 artifact 的候选拒绝。尚未实现 Step 3，故此验证不包含消息物理删除或 artifact 恢复。

@@ -159,6 +159,12 @@ impl TurnObservationDeduplicator {
             // byte-identical while the file changed outside the read range.
             // Show the fresh result once and rebase the recorded round so
             // subsequent reads can deduplicate against the fresh view.
+            //
+            // `edited_round > prior_round` deliberately uses strict
+            // inequality: a same-round edit + re-read (parallel tool calls in
+            // one round) is ambiguous — the edit may have happened before or
+            // after the original read — so suppressing dedup in that case
+            // would hide legitimate dedup of unchanged content.
             if tool_name == READ_TOOL_NAME {
                 if let Some(path) = file_path_from_result(tool_name, result, content) {
                     if let Some(edited_round) = self.edited_files.get(&path).copied() {
@@ -262,6 +268,12 @@ impl TurnObservationDeduplicator {
 /// (not worth tracking) or when the string is empty.
 fn compute_dedup_key(result_for_assistant: &str) -> Option<String> {
     if let Some(hash) = parse_content_sha256(result_for_assistant) {
+        // Persisted outputs are normally large, but round-budget persistence
+        // can also compress small results; keep the threshold consistent with
+        // the plain-content path so tiny messages are never deduplicated.
+        if result_for_assistant.chars().count() < MIN_DEDUP_CHARS {
+            return None;
+        }
         return Some(format!("persisted:{hash}"));
     }
 
@@ -286,13 +298,20 @@ fn compute_dedup_key(result_for_assistant: &str) -> Option<String> {
 }
 
 /// Extract the `Content sha256: <64 hex chars>` line from the header of a
-/// persisted-output message. Only the header lines (before the preview) are
-/// inspected so preview content can never be mistaken for the marker.
+/// persisted-output message.
+///
+/// Only the header lines (before the `Preview (first ...)` line) are
+/// inspected, and the scan is bounded to the first few lines, so preview
+/// content can never be mistaken for the marker — a preview may legitimately
+/// contain lines that look like a content hash (e.g. checksum manifests).
 fn parse_content_sha256(text: &str) -> Option<String> {
     if !text.starts_with(PERSISTED_OUTPUT_TAG) {
         return None;
     }
     for line in text.lines().take(16) {
+        if line.starts_with(PREVIEW_HEADER_PREFIX) {
+            break;
+        }
         let Some(rest) = line.strip_prefix(CONTENT_SHA256_LINE_PREFIX) else {
             continue;
         };
@@ -306,11 +325,19 @@ fn parse_content_sha256(text: &str) -> Option<String> {
 
 /// Canonical tail of a legacy persisted-output message: everything after the
 /// `Preview (first N chars):` header line, including any metadata section.
+///
+/// The search is bounded to the message header (first few lines) so a
+/// malformed message whose preview content contains a `Preview (first ...`
+/// line cannot yield a wrong canonical tail.
 fn legacy_persisted_canonical(text: &str) -> Option<&str> {
-    let marker_pos = text.find(PREVIEW_HEADER_PREFIX)?;
-    let rest = &text[marker_pos..];
-    let line_end = rest.find('\n')?;
-    Some(&rest[line_end + 1..])
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n').take(16) {
+        if line.starts_with(PREVIEW_HEADER_PREFIX) {
+            return Some(&text[offset + line.len()..]);
+        }
+        offset += line.len();
+    }
+    None
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -319,17 +346,15 @@ fn legacy_persisted_canonical(text: &str) -> Option<&str> {
 
 /// First meaningful line of an observation, truncated to keep markers short.
 fn build_descriptor(content: &str) -> String {
-    let first_line = if content.starts_with(PERSISTED_OUTPUT_TAG) {
-        // For persisted outputs the first line is just the tag; prefer the
-        // first meaningful header line (e.g. `Output too large (N chars)...`).
-        content
-            .lines()
-            .skip(1)
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or(content)
-    } else {
-        content.lines().next().unwrap_or(content)
-    };
+    // For persisted outputs the first line is just the tag; for any output,
+    // skip leading blank lines so the descriptor is never empty (e.g. a Bash
+    // result whose output starts with a newline).
+    let skip = usize::from(content.starts_with(PERSISTED_OUTPUT_TAG));
+    let first_line = content
+        .lines()
+        .skip(skip)
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(content);
 
     let truncated: String = first_line.chars().take(MAX_DESCRIPTOR_CHARS).collect();
     if truncated.chars().count() < first_line.chars().count() {
@@ -685,6 +710,49 @@ mod tests {
         assert!(
             is_dedup_marker(result_text(&out).unwrap_or_default()),
             "legacy persisted outputs with identical preview must dedup"
+        );
+    }
+
+    #[test]
+    fn preview_hash_lookalike_is_not_used_as_dedup_key() {
+        // A legacy persisted message has no header hash line. If the preview
+        // content itself contains a `Content sha256: <64 hex>` line (e.g. a
+        // checksum manifest), it must not be mistaken for the authoritative
+        // hash: two different outputs sharing that lookalike line must not
+        // deduplicate.
+        let mut dedup = TurnObservationDeduplicator::new();
+        let fake_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let body1 = format!("Content sha256: {fake_hash}\nline one\n{}", large(2000));
+        let body2 = format!("Content sha256: {fake_hash}\nline two\n{}", large(2000));
+
+        let msg1 =
+            make_tool_result_message("Read", &persisted_message(&body1, "aabbccdd", None), false);
+        let _ = dedup.apply(&msg1, 1);
+        let msg2 =
+            make_tool_result_message("Read", &persisted_message(&body2, "11223344", None), false);
+        let out = dedup.apply(&msg2, 2);
+        assert!(
+            !is_dedup_marker(result_text(&out).unwrap_or_default()),
+            "preview hash lookalike must not cause false dedup"
+        );
+    }
+
+    #[test]
+    fn descriptor_skips_blank_first_line() {
+        let mut dedup = TurnObservationDeduplicator::new();
+        let content = format!("\n{}", large(1000));
+        let msg1 = make_tool_result_message("Bash", &content, false);
+        let _ = dedup.apply(&msg1, 1);
+        let msg2 = make_tool_result_message("Bash", &content, false);
+        let out = dedup.apply(&msg2, 2);
+        let text = result_text(&out).unwrap_or_default();
+        assert!(
+            text.contains("(Bash: xxx"),
+            "descriptor must use the first non-blank line: {text}"
+        );
+        assert!(
+            !text.contains("(Bash: )"),
+            "descriptor must never be empty: {text}"
         );
     }
 

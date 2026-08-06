@@ -137,11 +137,13 @@
 
 ### 单元测试（全部通过）
 
-- `observation_dedup`：13 个测试（首现不变、重复替换、marker 自描述无 position、
+- `observation_dedup`：15 个测试（首现不变、重复替换、marker 自描述无 position、
   阈值、错误不参与、压缩重置、压缩标注、持久化同内容去重 / 不同内容不去重、
-  旧格式 preview 回退、编辑后保持新鲜并 rebase、失败编辑不抑制去重、不同内容不去重）。
+  旧格式 preview 回退、preview 内 hash 伪装行不误用、descriptor 跳过空首行、
+  编辑后保持新鲜并 rebase、失败编辑不抑制去重、不同内容不去重）。
 - `tool_contracts`：2 个持久化消息格式测试（hash 行渲染 / 空 hash 省略）。
-- `bitfun-core::agentic::tools::tool_result_storage`：6 个持久化测试（含 hash 行断言）。
+- `bitfun-core::agentic::tools::tool_result_storage`：7 个持久化测试（含 hash 行断言，
+  以及"两次超大 Read → 持久化 → 去重 marker"的端到端管道测试）。
 
 ### 全量回归
 
@@ -188,3 +190,37 @@
   存在 preview 碰撞风险但仅影响旧历史消息；新消息一律带全量 hash）。
 - **执行情况**：方案经专家评审后实施；代码、测试、文档一次提交（见 git log）；
   未做配置化与跨 turn 功能，符合"最小正确改动"原则。
+
+## 8. 第二轮审核与修复（2026-08-06）
+
+针对第一版提交做了逐行挑刺式复审，修复以下问题并补测：
+
+- **H1（真实 bug，触发面窄）**：`parse_content_sha256` 原先扫描前 16 行时不检查
+  `Preview (first ...` 边界。旧格式消息的 preview 若恰好含一行
+  `Content sha256: <64位hex>`（如校验和清单），会被误认为权威 hash，导致两个内容不同
+  但共享该行的输出被错误去重。修复：解析到 `Preview (` 行即停止（头部边界）。
+- **H2（真实 bug）**：`build_descriptor` 对普通内容取 `lines().next()` 不跳过空行，
+  Bash 输出以空行开头时 marker 出现 `(round 3, Bash: )` 空描述。修复：与持久化分支一致，
+  取第一个非空行。
+- **L1（健壮性）**：`legacy_persisted_canonical` 原先全文 `find("Preview (first ")`；
+  与 H1 一起改为仅在前 16 行头部内查找，避免畸形消息的 preview 内容误匹配。
+- **L2（一致性）**：新格式 persisted 去重路径补上 `MIN_DEDUP_CHARS` 阈值检查
+  （round-budget 可能持久化小结果），与 plain 路径对齐。
+- **L3（边界说明）**：新鲜度守卫保持严格 `>`（同 round 并行 Edit+Read 语义模糊，
+  抑制会误伤未变内容），已加注释说明。
+- **H3（测试缺口）**：新增端到端管道测试
+  `duplicate_large_read_is_deduplicated_with_persisted_hash`——两次超大 Read 走真实
+  `maybe_persist_large_tool_result` → `Message::tool_result` → `apply`，验证第二次被替换为
+  marker，且两侧 hash 行一致；防止持久化格式与去重解析之间再次漂移（P0-1 的教训）。
+- 新增回归测试：`preview_hash_lookalike_is_not_used_as_dedup_key`（H1）、
+  `descriptor_skips_blank_first_line`（H2）。
+
+复核结论：修复后 H1/H2 的旧行为均被新测试捕获（新代码下通过）；全量测试与真实 trace
+重分析结论不变（15 个旧去重决策保留、0 次新鲜度抑制）。
+
+仍未处理（设计取舍，建议单独评估）：
+- 重复大输出在去重前会被持久化两次（磁盘/IO 浪费，M1）。
+- `PersistedToolOutput` 公共结构体新增必填字段为 semver 破坏（仓库内仅 2 处构造点，M2）。
+- `working_directory`/`terminal_session_id` 进 hash 会压低跨上下文 Bash 去重命中率（M3）。
+- 历史会话中的旧 marker 仍引用错位 position，不做迁移（turn 级影响有限，L4）。
+- 持久化去重后 marker 不携带原始 reference，压缩后模型只能重跑（L5）。

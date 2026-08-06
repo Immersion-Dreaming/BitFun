@@ -366,9 +366,12 @@ fn tool_result_metadata(result: &ToolResult) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agentic::core::Message;
+    use crate::agentic::execution::observation_dedup::TurnObservationDeduplicator;
     use crate::agentic::tools::ToolRuntimeRestrictions;
     use crate::agentic::WorkspaceBinding;
     use serde_json::json;
+    use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -588,6 +591,64 @@ mod tests {
         assert!(session_dir.join("read_1.txt").exists());
         assert!(!session_dir.join("medium_1.txt").exists());
         assert!(!session_dir.join("bash_1.txt").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn duplicate_large_read_is_deduplicated_with_persisted_hash() {
+        // End-to-end pipeline check: two oversized Read results go through
+        // persistence (which stamps the full-content hash) and are then fed
+        // to the observation deduplicator exactly like the execution engine
+        // does. The second occurrence must be replaced by a marker, proving
+        // the persisted hash line produced in this crate is actually parsed
+        // by compute_dedup_key.
+        let root = temp_workspace("dup_read");
+        let context = test_context(root.clone());
+        let text = "x".repeat(READ_MAX_TOOL_RESULT_CHARS + 10);
+        let expected_hash = hex::encode(Sha256::digest(text.as_bytes()));
+
+        let processed1 =
+            maybe_persist_large_tool_result(tool_result("read_1", "Read", text.clone()), &context)
+                .await;
+        let processed2 =
+            maybe_persist_large_tool_result(tool_result("read_2", "Read", text), &context).await;
+
+        let msg1 = Message::tool_result(processed1);
+        let msg2 = Message::tool_result(processed2);
+        fn assistant_text(msg: &Message) -> String {
+            match &msg.content {
+                crate::agentic::core::MessageContent::ToolResult {
+                    result_for_assistant,
+                    ..
+                } => result_for_assistant.clone().unwrap_or_default(),
+                _ => String::new(),
+            }
+        }
+        fn content_hash(msg: &Message) -> String {
+            assistant_text(msg)
+                .lines()
+                .find_map(|line| line.strip_prefix("Content sha256: ").map(str::to_string))
+                .unwrap_or_default()
+        }
+
+        let first = assistant_text(&msg1);
+        assert!(first.starts_with(PERSISTED_OUTPUT_TAG));
+        assert!(first.contains("Content sha256: "));
+        assert_eq!(content_hash(&msg1), expected_hash);
+        assert_eq!(content_hash(&msg2), expected_hash);
+
+        let mut dedup = TurnObservationDeduplicator::new();
+        let stored1 = dedup.apply(&msg1, 1);
+        assert_eq!(assistant_text(&stored1), first);
+
+        let stored2 = dedup.apply(&msg2, 2);
+        let second = assistant_text(&stored2);
+        assert!(
+            second.starts_with("[Observation deduped:"),
+            "duplicate persisted read must be deduplicated: {second}"
+        );
+        assert!(!second.contains("context position"));
 
         let _ = std::fs::remove_dir_all(root);
     }

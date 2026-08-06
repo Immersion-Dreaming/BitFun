@@ -3752,13 +3752,14 @@ impl ExecutionEngine {
         let dedup_stats = observation_deduplicator.take_stats();
         info!(
             "Turn observation dedup stats: turn={}, replacements={}, persisted_hits={}, \
-             skipped_after_edit={}, resets={}, recovery_reads={}, chars_saved={}",
+             skipped_after_edit={}, resets={}, recovery_requests={}, recovery_successes={}, chars_saved={}",
             context.dialog_turn_id,
             dedup_stats.replacements,
             dedup_stats.persisted_hits,
             dedup_stats.skipped_after_edit,
             dedup_stats.resets,
-            dedup_stats.recovery_reads,
+            dedup_stats.recovery_requests,
+            dedup_stats.recovery_successes,
             dedup_stats.chars_saved
         );
 

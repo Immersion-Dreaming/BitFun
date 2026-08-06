@@ -28,7 +28,7 @@ use crate::agentic::core::{Message, MessageContent};
 use bitfun_agent_tools::PERSISTED_OUTPUT_TAG;
 use log::debug;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Minimum visible content length (chars) before we bother deduplicating.
 /// Small results don't meaningfully bloat context; skip them to avoid overhead.
@@ -76,9 +76,12 @@ pub(crate) struct DedupStats {
     pub skipped_after_edit: usize,
     /// Context-compression resets performed.
     pub resets: usize,
-    /// Reads of a path whose observation was deduplicated earlier this turn
-    /// (explicit re-reads; signals whether dedup disturbs the agent's path).
-    pub recovery_reads: usize,
+    /// Explicit repeat reads that were recognized as recovery requests.
+    pub recovery_requests: usize,
+    /// Recovery requests that received the full tool result instead of another
+    /// marker. This must equal `recovery_requests` in the current local
+    /// recovery policy.
+    pub recovery_successes: usize,
     /// Characters saved (original content minus marker) across replacements.
     pub chars_saved: usize,
 }
@@ -93,20 +96,46 @@ struct SeenObservation {
     /// Short, self-describing excerpt of the original content so the model can
     /// recognise what was omitted without a context position.
     descriptor: String,
+    /// The first duplicate is represented by a marker. The next explicit
+    /// execution of the same observation restores full content.
+    recovery_pending: bool,
+    /// Once recovery has occurred, keep this exact source/version visible
+    /// until an edit rebases it. Replacing it with more markers would repeat
+    /// the same recovery loop that prompted the explicit re-read.
+    full_delivery: bool,
+}
+
+/// The source of an observation matters as much as its bytes. In particular,
+/// two files containing identical boilerplate must not be treated as a single
+/// Read observation: their paths and line ranges carry different semantics to
+/// the agent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ObservationSource {
+    Read {
+        path: String,
+        start_line: Option<u64>,
+        end_line: Option<u64>,
+    },
+    Generic,
+}
+
+/// Content hash plus the tool and semantic source that produced it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ObservationKey {
+    tool_name: String,
+    source: ObservationSource,
+    content_key: String,
 }
 
 /// Per-turn tracker that detects duplicate tool-result observations and
 /// replaces them with a compact reference.
 #[derive(Debug, Default)]
 pub(crate) struct TurnObservationDeduplicator {
-    seen: HashMap<String, SeenObservation>,
+    seen: HashMap<ObservationKey, SeenObservation>,
     /// Logical paths mutated by Edit/Write, mapped to the round of the last
     /// successful mutation. Kept across compression resets: edit rounds stay
     /// valid chronological anchors and keep the freshness guard working.
     edited_files: HashMap<String, usize>,
-    /// Paths whose Read observation was replaced by a marker this turn; used
-    /// to count explicit re-reads (`dedup_recovery_reads`).
-    deduped_read_paths: HashSet<String>,
     stats: DedupStats,
 }
 
@@ -179,10 +208,10 @@ impl TurnObservationDeduplicator {
     ///
     /// * If this is the **first** time we see this content, record it and
     ///   return the message unchanged.
-    /// * If we have **seen the same content before**, return a copy of the
-    ///   message with `result_for_assistant` replaced by a short reference —
-    ///   unless the observation came from a file that was edited after the
-    ///   original observation (freshness guard).
+    /// * If we have **seen the same observation before**, replace its first
+    ///   duplicate with a short reference. A further explicit read restores
+    ///   the complete result and keeps that source visible until an edit.
+    ///   A file edited after the original observation is always kept fresh.
     ///
     /// `round_index` is the execution round the message belongs to; markers
     /// reference it instead of a message position so they stay valid across
@@ -224,21 +253,17 @@ impl TurnObservationDeduplicator {
             return msg.clone();
         }
 
-        let Some(key) = compute_dedup_key(content) else {
+        let Some(content_key) = compute_dedup_key(content) else {
             return msg.clone();
         };
 
-        // Count explicit re-reads of files whose observations were replaced
-        // by a marker earlier in this turn (recovery reads).
-        if tool_name == READ_TOOL_NAME {
-            if let Some(path) = file_path_from_result(tool_name, result, content) {
-                if self.deduped_read_paths.contains(&normalize_path_key(&path)) {
-                    self.stats.recovery_reads += 1;
-                }
-            }
-        }
+        let key = ObservationKey {
+            tool_name: tool_name.clone(),
+            source: observation_source(tool_name, result, content),
+            content_key,
+        };
 
-        if let Some(prior) = self.seen.get(&key) {
+        if let Some(prior) = self.seen.get_mut(&key) {
             let prior_round = prior.round_index;
             let prior_tool = prior.tool_name.clone();
             let prior_descriptor = prior.descriptor.clone();
@@ -264,18 +289,33 @@ impl TurnObservationDeduplicator {
                                 tool_name, round_index, edited_round, prior_descriptor
                             );
                             self.stats.skipped_after_edit += 1;
-                            self.seen.insert(
-                                key,
-                                SeenObservation {
-                                    round_index,
-                                    tool_name: tool_name.clone(),
-                                    descriptor: build_descriptor(tool_name, result, content),
-                                },
-                            );
+                            *prior = SeenObservation {
+                                round_index,
+                                tool_name: tool_name.clone(),
+                                descriptor: build_descriptor(tool_name, result, content),
+                                recovery_pending: false,
+                                full_delivery: false,
+                            };
                             return msg.clone();
                         }
                     }
                 }
+            }
+
+            if prior.recovery_pending {
+                prior.recovery_pending = false;
+                prior.full_delivery = true;
+                self.stats.recovery_requests += 1;
+                self.stats.recovery_successes += 1;
+                debug!(
+                    "Observation recovery restored full result: tool={}, round={}, original_round={}, descriptor={:?}",
+                    tool_name, round_index, prior_round, prior_descriptor
+                );
+                return msg.clone();
+            }
+
+            if prior.full_delivery {
+                return msg.clone();
             }
 
             debug!(
@@ -283,22 +323,18 @@ impl TurnObservationDeduplicator {
                 tool_name, round_index, prior_round, prior_descriptor
             );
             let replacement = format!(
-                "[Observation deduped: identical content was already presented at round {} ({}: {}). Omitted to reduce context size. Call Read/Bash again if the content may have changed.]",
+                "{DEDUP_MARKER_PREFIX} identical content was already presented at round {} ({}: {}). Omitted to reduce context size. Re-read this exact source once if the full content is needed.]",
                 prior_round, prior_tool, prior_descriptor
             );
             self.stats.replacements += 1;
-            if key.starts_with(PERSISTED_KEY_PREFIX) {
+            if key.content_key.starts_with(PERSISTED_KEY_PREFIX) {
                 self.stats.persisted_hits += 1;
             }
             self.stats.chars_saved += content
                 .chars()
                 .count()
                 .saturating_sub(replacement.chars().count());
-            if tool_name == READ_TOOL_NAME {
-                if let Some(path) = file_path_from_result(tool_name, result, content) {
-                    self.deduped_read_paths.insert(normalize_path_key(&path));
-                }
-            }
+            prior.recovery_pending = true;
             return replace_result_for_assistant(msg, replacement);
         }
 
@@ -309,6 +345,8 @@ impl TurnObservationDeduplicator {
                 round_index,
                 tool_name: tool_name.clone(),
                 descriptor: build_descriptor(tool_name, result, content),
+                recovery_pending: false,
+                full_delivery: false,
             },
         );
         msg.clone()
@@ -325,9 +363,9 @@ impl TurnObservationDeduplicator {
         self.stats.resets += 1;
         let count = self.seen.len();
         self.seen.clear();
-        // `edited_files` and `deduped_read_paths` are intentionally kept:
-        // edit rounds stay valid chronological anchors, and recovery-read
-        // tracking spans compressions.
+        // Edit rounds stay valid chronological anchors. Recovery state is tied
+        // to markers still visible in history, so clearing `seen` also drops
+        // all pending/full-delivery state after compression.
         if count > 0 {
             debug!(
                 "ObservationDeduplicator reset after compression: cleared {} entries",
@@ -380,6 +418,42 @@ fn compute_dedup_key(result_for_assistant: &str) -> Option<String> {
         "plain:{}",
         hex::encode(Sha256::digest(result_for_assistant.as_bytes()))
     ))
+}
+
+/// Build the semantic source portion of an observation key. Content equality
+/// alone is not sufficient for Reads: identical text from different files or
+/// line ranges has different meaning and must remain independently visible.
+fn observation_source(
+    tool_name: &str,
+    result: &serde_json::Value,
+    result_for_assistant: &str,
+) -> ObservationSource {
+    if tool_name != READ_TOOL_NAME {
+        return ObservationSource::Generic;
+    }
+
+    let Some(path) = file_path_from_result(tool_name, result, result_for_assistant) else {
+        return ObservationSource::Generic;
+    };
+    let start_line = result.get("start_line").and_then(|value| value.as_u64());
+    let end_line = start_line.zip(
+        result
+            .get("lines_read")
+            .and_then(|value| value.as_u64()),
+    )
+    .map(|(start, lines_read)| {
+        if lines_read > 0 {
+            start + lines_read - 1
+        } else {
+            start
+        }
+    });
+
+    ObservationSource::Read {
+        path: normalize_path_key(&path),
+        start_line,
+        end_line,
+    }
 }
 
 /// Extract the `Content sha256: <64 hex chars>` line from the header of a
@@ -645,8 +719,16 @@ mod tests {
     }
 
     fn read_message(path: &str, body: &str, round_lines: bool) -> Message {
-        let start = 1;
-        let end = 50;
+        read_message_with_range(path, 1, 50, body, round_lines)
+    }
+
+    fn read_message_with_range(
+        path: &str,
+        start: u64,
+        end: u64,
+        body: &str,
+        round_lines: bool,
+    ) -> Message {
         let total = 100;
         let header = format!("Read lines {start}-{end} from {path} ({total} total lines)");
         let content = if round_lines {
@@ -733,6 +815,87 @@ mod tests {
     }
 
     #[test]
+    fn marker_then_exact_reread_restores_and_keeps_full_content() {
+        let mut dedup = TurnObservationDeduplicator::new();
+        let body = large(1000);
+        let read = read_message("src/lib.rs", &body, true);
+
+        let _ = dedup.apply(&read, 1);
+        let marker = dedup.apply(&read, 2);
+        assert!(is_dedup_marker(result_text(&marker).unwrap_or_default()));
+
+        let recovered = dedup.apply(&read, 3);
+        assert_eq!(result_text(&recovered), result_text(&read));
+
+        // A recovery upgrades this exact source until a real edit changes
+        // the file version. It must not fall back into marker loops.
+        let later_read = dedup.apply(&read, 4);
+        assert_eq!(result_text(&later_read), result_text(&read));
+
+        let stats = dedup.take_stats();
+        assert_eq!(stats.replacements, 1);
+        assert_eq!(stats.recovery_requests, 1);
+        assert_eq!(stats.recovery_successes, 1);
+    }
+
+    #[test]
+    fn edit_reenables_dedup_after_a_recovered_read() {
+        let mut dedup = TurnObservationDeduplicator::new();
+        let read = read_message("src/lib.rs", &large(1000), true);
+
+        let _ = dedup.apply(&read, 1);
+        let _ = dedup.apply(&read, 2);
+        let recovered = dedup.apply(&read, 3);
+        assert_eq!(result_text(&recovered), result_text(&read));
+
+        let edit = make_tool_result_with_path(
+            "Edit",
+            "Successfully edited src/lib.rs",
+            "src/lib.rs",
+            Some(true),
+        );
+        let _ = dedup.apply(&edit, 4);
+
+        // The first post-edit read is full, then the new file version can be
+        // deduplicated again if the agent repeats it.
+        let fresh = dedup.apply(&read, 5);
+        assert_eq!(result_text(&fresh), result_text(&read));
+        let marker = dedup.apply(&read, 6);
+        assert!(is_dedup_marker(result_text(&marker).unwrap_or_default()));
+    }
+
+    #[test]
+    fn persisted_reads_with_identical_payloads_but_different_paths_do_not_dedup() {
+        let mut dedup = TurnObservationDeduplicator::new();
+        let body = large(3000);
+        let persisted = persisted_message(&body, "aabbccdd", Some(&sha256_hex(&body)));
+        let first = read_message("src/a.rs", &persisted, false);
+        let second = read_message("src/b.rs", &persisted, false);
+
+        let _ = dedup.apply(&first, 1);
+        let out = dedup.apply(&second, 2);
+        assert!(
+            !is_dedup_marker(result_text(&out).unwrap_or_default()),
+            "the Read path is part of the observation identity"
+        );
+    }
+
+    #[test]
+    fn identical_content_from_different_read_ranges_does_not_dedup() {
+        let mut dedup = TurnObservationDeduplicator::new();
+        let body = large(1000);
+        let first = read_message_with_range("src/lib.rs", 1, 50, &body, false);
+        let second = read_message_with_range("src/lib.rs", 51, 100, &body, false);
+
+        let _ = dedup.apply(&first, 1);
+        let out = dedup.apply(&second, 2);
+        assert!(
+            !is_dedup_marker(result_text(&out).unwrap_or_default()),
+            "the Read range is part of the observation identity"
+        );
+    }
+
+    #[test]
     fn marker_is_self_describing_and_has_no_context_position() {
         let mut dedup = TurnObservationDeduplicator::new();
         let content = large(1000);
@@ -795,6 +958,26 @@ mod tests {
             !is_dedup_marker(text),
             "after compression reset, same content should be treated as new"
         );
+    }
+
+    #[test]
+    fn compression_clears_pending_recovery_state() {
+        let mut dedup = TurnObservationDeduplicator::new();
+        let read = read_message("src/lib.rs", &large(1000), true);
+
+        let _ = dedup.apply(&read, 1);
+        let marker = dedup.apply(&read, 2);
+        assert!(is_dedup_marker(result_text(&marker).unwrap_or_default()));
+
+        dedup.reset_after_compression();
+
+        // The old marker can be absent after compression, so the following
+        // read becomes a new full observation rather than a stale recovery.
+        let out = dedup.apply(&read, 3);
+        assert_eq!(result_text(&out), result_text(&read));
+        let stats = dedup.take_stats();
+        assert_eq!(stats.recovery_requests, 0);
+        assert_eq!(stats.recovery_successes, 0);
     }
 
     #[test]
@@ -1126,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn dedup_stats_count_replacements_recovery_and_savings() {
+    fn dedup_stats_count_replacement_recovery_and_savings() {
         let mut dedup = TurnObservationDeduplicator::new();
         let body = large(1000);
         let read = read_message("src/lib.rs", &body, true);
@@ -1135,7 +1318,10 @@ mod tests {
         let out = dedup.apply(&read, 2);
         assert!(is_dedup_marker(result_text(&out).unwrap_or_default()));
         let out = dedup.apply(&read, 3);
-        assert!(is_dedup_marker(result_text(&out).unwrap_or_default()));
+        assert!(
+            !is_dedup_marker(result_text(&out).unwrap_or_default()),
+            "an explicit re-read after a marker must restore full content"
+        );
 
         let edit = make_tool_result_with_path(
             "Edit",
@@ -1149,13 +1335,11 @@ mod tests {
 
         dedup.reset_after_compression();
         let stats = dedup.take_stats();
-        assert_eq!(stats.replacements, 2);
+        assert_eq!(stats.replacements, 1);
         assert_eq!(stats.skipped_after_edit, 1);
         assert_eq!(stats.resets, 1);
-        assert_eq!(
-            stats.recovery_reads, 2,
-            "reads 3 and 5 re-read a deduped path"
-        );
+        assert_eq!(stats.recovery_requests, 1);
+        assert_eq!(stats.recovery_successes, 1);
         assert!(stats.chars_saved > 0);
         assert_eq!(stats.persisted_hits, 0);
     }

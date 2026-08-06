@@ -2760,7 +2760,7 @@ impl ExecutionEngine {
         // is not a stop condition.
         let mut thinking_only_rescue_attempts: usize = 0;
         let mut partial_continuation_attempts: usize = 0;
-        // ── Lifecycle facts (phase 1: no estimator and no context mutation) ─
+        // ── Lifecycle state (shadow estimator, no context mutation) ─
         let mut lifecycle_registry = {
             match self
                 .session_manager

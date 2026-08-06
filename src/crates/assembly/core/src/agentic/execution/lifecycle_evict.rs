@@ -1,83 +1,472 @@
-//! Segment-level lifecycle eviction for long-running agent tool loops.
+//! Lifecycle facts for task-aware context eviction.
 //!
-//! A lifecycle tick is one completed assistant/tool-result round. The model
-//! estimates state every fixed batch of ticks; deterministic guards decide
-//! whether an evictable segment may be physically replaced.
+//! This module deliberately owns no message rewriting. The execution loop records
+//! deterministic facts here; its worker may query the configured fast model with
+//! immutable snapshots, then applies the result through a guarded reducer.
 
-use crate::agentic::core::message::{InternalReminderKind, Message, MessageContent, ToolCall};
+use crate::agentic::core::message::{Message, MessageContent, ToolCall};
+use crate::infrastructure::ai::get_global_ai_client_factory;
 use crate::util::errors::{BitFunError, BitFunResult};
 use crate::util::types::Message as AIMessage;
-use log::warn;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 
 pub(crate) const LIFECYCLE_REGISTRY_METADATA_KEY: &str = "lifecycleEvictionRegistry";
-pub(crate) const LIFECYCLE_BATCH_SIZE: usize = 3;
-pub(crate) const RECENT_SEGMENTS_TO_PROTECT: u64 = 2;
-const INTENT_PREVIEW_CHARS: usize = 800;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct LifecycleRegistry {
-    #[serde(default)]
-    pub(crate) version: u64,
-    #[serde(default)]
-    pub(crate) latest_tick_seq: u64,
-    #[serde(default)]
-    pub(crate) last_estimated_tick_seq: u64,
-    #[serde(default)]
-    pub(crate) segments: BTreeMap<String, LifecycleSegment>,
+const REGISTRY_SCHEMA_VERSION: u32 = 2;
+const RESULT_PREVIEW_CHARS: usize = 600;
+const LIFECYCLE_BATCH_SIZE: u64 = 3;
+const RECENT_SEGMENTS_TO_PROTECT: u64 = 2;
+const ESTIMATOR_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn default_schema_version() -> u32 {
+    REGISTRY_SCHEMA_VERSION
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+/// Lifecycle state belongs to a task. A segment is only the eventual physical
+/// replacement unit and must not independently become evictable.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum LifecycleSegmentState {
+pub(crate) enum LifecycleTaskState {
     Active,
     Completed,
     Evictable,
+}
+
+impl Default for LifecycleTaskState {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct LifecycleTask {
+    pub(crate) id: String,
+    /// Revision is the optimistic-concurrency token for one task, not for the
+    /// entire registry. It is incremented whenever deterministic facts change.
+    #[serde(default)]
+    pub(crate) revision: u64,
+    #[serde(default)]
+    pub(crate) title: Option<String>,
+    /// Immutable source fact. It is never truncated in persistence.
+    #[serde(default)]
+    pub(crate) original_user_prompt: String,
+    /// Initially equals the complete user prompt. A future estimator may add a
+    /// normalized objective but may not overwrite the original prompt.
+    #[serde(default)]
+    pub(crate) objective: String,
+    #[serde(default)]
+    pub(crate) acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    pub(crate) lifecycle: LifecycleTaskState,
+    #[serde(default)]
+    pub(crate) covered_turn_ids: Vec<String>,
+    #[serde(default)]
+    pub(crate) segment_ids: Vec<String>,
+    #[serde(default)]
+    pub(crate) completion_evidence: Vec<String>,
+    #[serde(default)]
+    pub(crate) unresolved_items: Vec<String>,
+    #[serde(default)]
+    pub(crate) dependencies: Vec<String>,
+    #[serde(default)]
+    pub(crate) last_activity_tick: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct LifecycleToolFact {
+    pub(crate) tool_id: String,
+    pub(crate) tool_name: String,
+    pub(crate) arguments_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct LifecycleResultFact {
+    pub(crate) tool_id: String,
+    pub(crate) tool_name: String,
+    pub(crate) is_error: bool,
+    pub(crate) char_count: usize,
+    pub(crate) content_sha256: String,
+    pub(crate) preview: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct LifecycleSegment {
     pub(crate) id: String,
     pub(crate) turn_id: String,
+    /// Empty only while reading a v1 registry. `normalize_after_load` assigns
+    /// a conservative legacy owner before the registry is used.
+    #[serde(default)]
+    pub(crate) owner_task_id: String,
     pub(crate) tick_seq: u64,
+    #[serde(default)]
     pub(crate) tool_call_ids: Vec<String>,
+    #[serde(default)]
     pub(crate) tool_names: Vec<String>,
+    #[serde(default)]
+    pub(crate) tool_facts: Vec<LifecycleToolFact>,
+    #[serde(default)]
+    pub(crate) result_facts: Vec<LifecycleResultFact>,
+    #[serde(default)]
     pub(crate) has_error: bool,
+    #[serde(default)]
     pub(crate) has_pending_todo: bool,
+    #[serde(default)]
     pub(crate) token_estimate: usize,
-    #[serde(default)]
-    pub(crate) intent: String,
-    pub(crate) state: LifecycleSegmentState,
-    #[serde(default)]
-    pub(crate) completion_evidence: Vec<String>,
-    #[serde(default)]
-    pub(crate) unresolved_questions: Vec<String>,
     #[serde(default)]
     pub(crate) evicted: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct LifecycleEstimatorDelta {
-    #[serde(rename = "baseVersion")]
-    base_version: u64,
-    #[serde(rename = "segmentUpdates")]
-    segment_updates: Vec<LifecycleSegmentUpdate>,
+/// Durable, deterministic lifecycle facts. `registry_revision` is only an
+/// audit marker; async reducer correctness will use `LifecycleTask::revision`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct LifecycleRegistry {
+    #[serde(default = "default_schema_version")]
+    pub(crate) schema_version: u32,
+    #[serde(default)]
+    pub(crate) registry_revision: u64,
+    #[serde(default)]
+    pub(crate) latest_tick_seq: u64,
+    #[serde(default)]
+    pub(crate) last_snapshot_tick_seq: u64,
+    #[serde(default)]
+    pub(crate) last_finished_snapshot_tick_seq: u64,
+    #[serde(default)]
+    pub(crate) next_snapshot_seq: u64,
+    #[serde(default)]
+    pub(crate) tasks: BTreeMap<String, LifecycleTask>,
+    #[serde(default)]
+    pub(crate) segments: BTreeMap<String, LifecycleSegment>,
+    /// A turn owns one provisional task in phase one. A later reducer may
+    /// propose a validated merge, but no inference silently changes ownership.
+    #[serde(default)]
+    pub(crate) turn_task_ids: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct LifecycleSegmentUpdate {
-    #[serde(rename = "segmentId")]
-    segment_id: String,
-    lifecycle: LifecycleSegmentState,
-    #[serde(rename = "completionEvidence", default)]
-    completion_evidence: Vec<String>,
-    #[serde(rename = "unresolvedQuestions", default)]
-    unresolved_questions: Vec<String>,
+impl Default for LifecycleRegistry {
+    fn default() -> Self {
+        Self {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            registry_revision: 0,
+            latest_tick_seq: 0,
+            last_snapshot_tick_seq: 0,
+            last_finished_snapshot_tick_seq: 0,
+            next_snapshot_seq: 0,
+            tasks: BTreeMap::new(),
+            segments: BTreeMap::new(),
+            turn_task_ids: BTreeMap::new(),
+        }
+    }
+}
+
+/// Immutable estimator input. It contains deterministic task and tool facts,
+/// but deliberately contains no raw assistant reasoning content.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LifecycleEstimatorSnapshot {
+    pub(crate) schema_version: u32,
+    pub(crate) snapshot_id: String,
+    pub(crate) created_at_tick: u64,
+    pub(crate) current_turn_id: String,
+    pub(crate) current_task_id: String,
+    /// The complete source prompt is exposed only for the current user task.
+    pub(crate) current_user_prompt: String,
+    pub(crate) tasks: Vec<LifecycleTaskSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LifecycleTaskSnapshot {
+    pub(crate) task_id: String,
+    pub(crate) expected_revision: u64,
+    pub(crate) title: Option<String>,
+    /// Older tasks do not repeat the raw source prompt. This field is present
+    /// only after a future normalized objective differs from that source.
+    pub(crate) normalized_objective: Option<String>,
+    pub(crate) lifecycle: LifecycleTaskState,
+    pub(crate) acceptance_criteria: Vec<String>,
+    pub(crate) completion_evidence: Vec<String>,
+    pub(crate) unresolved_items: Vec<String>,
+    pub(crate) dependencies: Vec<String>,
+    pub(crate) last_activity_tick: u64,
+    pub(crate) segments: Vec<LifecycleSegment>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LifecycleEstimatorDelta {
+    pub(crate) snapshot_id: String,
+    #[serde(default)]
+    pub(crate) task_updates: Vec<LifecycleTaskUpdate>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LifecycleTaskUpdate {
+    pub(crate) task_id: String,
+    pub(crate) expected_revision: u64,
+    pub(crate) lifecycle: LifecycleTaskState,
+    #[serde(default)]
+    pub(crate) completion_evidence: Vec<String>,
+    #[serde(default)]
+    pub(crate) unresolved_items: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LifecycleReducerRejection {
+    pub(crate) task_id: String,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LifecycleReducerOutcome {
+    pub(crate) applied_task_ids: Vec<String>,
+    pub(crate) rejected_updates: Vec<LifecycleReducerRejection>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LifecycleScheduleDisposition {
+    Started,
+    Coalesced,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LifecycleWorkerResult {
+    pub(crate) snapshot: LifecycleEstimatorSnapshot,
+    pub(crate) response: Result<String, String>,
+    pub(crate) duration_ms: u64,
+}
+
+struct LifecycleInflightJob {
+    snapshot: LifecycleEstimatorSnapshot,
+    handle: JoinHandle<LifecycleWorkerResult>,
+}
+
+impl Drop for LifecycleInflightJob {
+    fn drop(&mut self) {
+        // Tokio detaches a task when its JoinHandle is dropped. Lifecycle jobs
+        // must instead stop with their scheduler so a destroyed engine cannot
+        // leave a paid estimator request running and then recover the same
+        // snapshot in a new engine instance.
+        self.handle.abort();
+    }
+}
+
+trait LifecycleEstimatorWorker: Send + Sync {
+    fn spawn(&self, snapshot: LifecycleEstimatorSnapshot) -> LifecycleInflightJob;
+}
+
+struct FastModelLifecycleEstimatorWorker;
+
+impl LifecycleEstimatorWorker for FastModelLifecycleEstimatorWorker {
+    fn spawn(&self, snapshot: LifecycleEstimatorSnapshot) -> LifecycleInflightJob {
+        spawn_lifecycle_worker(snapshot, |snapshot| async move {
+            estimate_snapshot_with_fast_model(snapshot).await
+        })
+    }
+}
+
+#[derive(Default)]
+struct LifecycleSessionScheduler {
+    inflight: Option<LifecycleInflightJob>,
+    pending: Option<LifecycleEstimatorSnapshot>,
+}
+
+/// Process-local asynchronous scheduler. Its eventual engine owner keys jobs
+/// by session, so distinct sessions cannot stall each other while a single
+/// session retains deterministic result ordering.
+pub(crate) struct LifecycleEstimatorScheduler {
+    worker: Arc<dyn LifecycleEstimatorWorker>,
+    sessions: BTreeMap<String, LifecycleSessionScheduler>,
+}
+
+impl LifecycleEstimatorScheduler {
+    fn new(worker: Arc<dyn LifecycleEstimatorWorker>) -> Self {
+        Self {
+            worker,
+            sessions: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn with_fast_model_worker() -> Self {
+        Self::new(Arc::new(FastModelLifecycleEstimatorWorker))
+    }
+
+    pub(crate) fn submit(
+        &mut self,
+        session_id: &str,
+        snapshot: LifecycleEstimatorSnapshot,
+    ) -> LifecycleScheduleDisposition {
+        let state = self.sessions.entry(session_id.to_string()).or_default();
+        if state.inflight.is_some() {
+            state.pending = Some(snapshot);
+            return LifecycleScheduleDisposition::Coalesced;
+        }
+        state.inflight = Some(self.worker.spawn(snapshot));
+        LifecycleScheduleDisposition::Started
+    }
+
+    /// Polls only a completed handle. Awaiting after `is_finished` does not put
+    /// an estimator request on the agent critical path.
+    pub(crate) async fn poll_ready(&mut self, session_id: &str) -> Option<LifecycleWorkerResult> {
+        let mut job = {
+            let state = self.sessions.get_mut(session_id)?;
+            if !state
+                .inflight
+                .as_ref()
+                .is_some_and(|job| job.handle.is_finished())
+            {
+                return None;
+            }
+            state.inflight.take().expect("checked above")
+        };
+        let result = match (&mut job.handle).await {
+            Ok(result) => result,
+            Err(error) => LifecycleWorkerResult {
+                snapshot: job.snapshot.clone(),
+                response: Err(format!("lifecycle estimator worker join error: {error}")),
+                duration_ms: 0,
+            },
+        };
+        let remove_session = {
+            let state = self
+                .sessions
+                .get_mut(session_id)
+                .expect("session state exists");
+            if let Some(next) = state.pending.take() {
+                state.inflight = Some(self.worker.spawn(next));
+            }
+            state.inflight.is_none() && state.pending.is_none()
+        };
+        if remove_session {
+            self.sessions.remove(session_id);
+        }
+        Some(result)
+    }
+
+    pub(crate) fn has_work(&self, session_id: &str) -> bool {
+        self.sessions
+            .get(session_id)
+            .is_some_and(|state| state.inflight.is_some() || state.pending.is_some())
+    }
+}
+
+fn spawn_lifecycle_worker<F, Fut>(
+    snapshot: LifecycleEstimatorSnapshot,
+    worker: F,
+) -> LifecycleInflightJob
+where
+    F: FnOnce(LifecycleEstimatorSnapshot) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<String, String>> + Send + 'static,
+{
+    let job_snapshot = snapshot.clone();
+    let handle = tokio::spawn(async move {
+        let started = Instant::now();
+        let response = worker(snapshot.clone()).await;
+        LifecycleWorkerResult {
+            snapshot,
+            response,
+            duration_ms: started.elapsed().as_millis() as u64,
+        }
+    });
+    LifecycleInflightJob {
+        snapshot: job_snapshot,
+        handle,
+    }
+}
+
+async fn estimate_snapshot_with_fast_model(
+    snapshot: LifecycleEstimatorSnapshot,
+) -> Result<String, String> {
+    const PROMPT: &str = r#"You are a conservative lifecycle estimator for a software-engineering agent. Return ONLY JSON with this schema: {"snapshotId": string, "taskUpdates": [{"taskId": string, "expectedRevision": number, "lifecycle": "active"|"completed"|"evictable", "completionEvidence": [string], "unresolvedItems": [string]}]}. Use only task IDs and revisions from the input. Never make a task evictable if it has an error, unfinished Todo, unresolved item, recent activity, or uncertainty. A task must first be completed with concrete evidence before it becomes evictable. Prefer no update over a risky update."#;
+    let input = serde_json::to_string(&snapshot)
+        .map_err(|error| format!("lifecycle snapshot serialization: {error}"))?;
+    let request = async {
+        let factory = get_global_ai_client_factory()
+            .await
+            .map_err(|error| format!("lifecycle estimator factory: {error}"))?;
+        let client = factory
+            .get_client_resolved("fast")
+            .await
+            .map_err(|error| format!("lifecycle estimator client: {error}"))?;
+        let response = client
+            .send_message_with_trace(
+                vec![
+                    AIMessage::system(PROMPT.to_string()),
+                    AIMessage::user(input),
+                ],
+                None,
+                None,
+            )
+            .await
+            .map_err(|error| format!("lifecycle estimator request: {error}"))?;
+        Ok::<String, String>(response.text)
+    };
+    tokio::time::timeout(ESTIMATOR_TIMEOUT, request)
+        .await
+        .map_err(|_| {
+            format!(
+                "lifecycle estimator timed out after {}s",
+                ESTIMATOR_TIMEOUT.as_secs()
+            )
+        })?
+}
+
+pub(crate) fn parse_estimator_delta(text: &str) -> BitFunResult<LifecycleEstimatorDelta> {
+    let json = extract_json_object(text)
+        .ok_or_else(|| BitFunError::tool("lifecycle estimator response has no JSON object"))?;
+    serde_json::from_str(json)
+        .map_err(|error| BitFunError::tool(format!("lifecycle estimator invalid delta: {error}")))
 }
 
 impl LifecycleRegistry {
-    /// Records exactly one completed tool round and returns its stable segment ID.
+    /// Creates one conservative provisional task for an actual user turn. The
+    /// source prompt is kept exactly as supplied; no character cap is applied.
+    pub(crate) fn observe_user_turn(
+        &mut self,
+        turn_id: &str,
+        original_user_prompt: &str,
+    ) -> String {
+        if let Some(task_id) = self.turn_task_ids.get(turn_id) {
+            return task_id.clone();
+        }
+        let task_id = format!("task:{turn_id}");
+        self.tasks.insert(
+            task_id.clone(),
+            LifecycleTask {
+                id: task_id.clone(),
+                revision: 1,
+                title: None,
+                original_user_prompt: original_user_prompt.to_string(),
+                objective: original_user_prompt.to_string(),
+                acceptance_criteria: vec![],
+                lifecycle: LifecycleTaskState::Active,
+                covered_turn_ids: vec![turn_id.to_string()],
+                segment_ids: vec![],
+                completion_evidence: vec![],
+                unresolved_items: vec![],
+                dependencies: vec![],
+                last_activity_tick: self.latest_tick_seq,
+            },
+        );
+        self.turn_task_ids
+            .insert(turn_id.to_string(), task_id.clone());
+        self.registry_revision += 1;
+        task_id
+    }
+
+    /// Records a completed assistant/tool-result round. It intentionally does
+    /// not inspect reasoning content: raw chain-of-thought is not a lifecycle
+    /// signal and is never copied into estimator input.
     pub(crate) fn record_segment(
         &mut self,
         messages: &[Message],
@@ -85,12 +474,7 @@ impl LifecycleRegistry {
         end_idx: usize,
         turn_id: &str,
     ) -> Option<String> {
-        let MessageContent::Mixed {
-            reasoning_content,
-            text,
-            tool_calls,
-        } = &messages.get(assistant_idx)?.content
-        else {
+        let MessageContent::Mixed { tool_calls, .. } = &messages.get(assistant_idx)?.content else {
             return None;
         };
         if tool_calls.is_empty() {
@@ -99,307 +483,501 @@ impl LifecycleRegistry {
         let results = messages.get(assistant_idx + 1..end_idx)?;
         let tool_call_ids: Vec<String> =
             tool_calls.iter().map(|call| call.tool_id.clone()).collect();
-        let id = format!("{}:{}", turn_id, tool_call_ids.join(","));
+        let id = format!("{turn_id}:{}", tool_call_ids.join(","));
         if self.segments.contains_key(&id) {
             return Some(id);
         }
+
+        let owner_task_id = self.ensure_task_for_turn(turn_id);
         self.latest_tick_seq += 1;
-        let intent = [reasoning_content.as_deref().unwrap_or(""), text.as_str()]
-            .into_iter()
-            .filter(|value| !value.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let tool_facts = tool_calls
+            .iter()
+            .map(|call| LifecycleToolFact {
+                tool_id: call.tool_id.clone(),
+                tool_name: call.tool_name.clone(),
+                arguments_json: serde_json::to_string(&call.arguments).unwrap_or_default(),
+            })
+            .collect();
+        let result_facts = results.iter().filter_map(result_fact).collect::<Vec<_>>();
+        let has_error = result_facts.iter().any(|fact| fact.is_error);
+        let has_pending_todo = tool_calls.iter().any(todo_call_has_pending_items);
+        let token_estimate = result_facts
+            .iter()
+            .map(|fact| fact.char_count)
+            .sum::<usize>()
+            / 4;
+
         self.segments.insert(
             id.clone(),
             LifecycleSegment {
                 id: id.clone(),
                 turn_id: turn_id.to_string(),
+                owner_task_id: owner_task_id.clone(),
                 tick_seq: self.latest_tick_seq,
                 tool_call_ids,
                 tool_names: tool_calls
                     .iter()
                     .map(|call| call.tool_name.clone())
                     .collect(),
-                has_error: results.iter().any(|message| {
-                    matches!(
-                        message.content,
-                        MessageContent::ToolResult { is_error: true, .. }
-                    )
-                }),
-                has_pending_todo: tool_calls.iter().any(todo_call_has_pending_items),
-                token_estimate: results.iter().map(message_char_estimate).sum::<usize>() / 4,
-                intent: truncate_chars(&intent, INTENT_PREVIEW_CHARS),
-                state: LifecycleSegmentState::Active,
-                completion_evidence: vec![],
-                unresolved_questions: vec![],
+                tool_facts,
+                result_facts,
+                has_error,
+                has_pending_todo,
+                token_estimate,
                 evicted: false,
             },
         );
+        let task = self
+            .tasks
+            .get_mut(&owner_task_id)
+            .expect("owner task exists");
+        task.segment_ids.push(id.clone());
+        task.last_activity_tick = self.latest_tick_seq;
+        task.revision += 1;
+        self.registry_revision += 1;
         Some(id)
     }
 
-    pub(crate) fn should_estimate(&self) -> bool {
-        self.latest_tick_seq > self.last_estimated_tick_seq
-            && self.latest_tick_seq % LIFECYCLE_BATCH_SIZE as u64 == 0
-    }
-
-    pub(crate) fn build_vi(&self, current_turn_id: &str) -> BitFunResult<String> {
-        #[derive(Serialize)]
-        struct Input<'a> {
-            #[serde(rename = "baseVersion")]
-            base_version: u64,
-            #[serde(rename = "latestTickSeq")]
-            latest_tick_seq: u64,
-            #[serde(rename = "currentTurnId")]
-            current_turn_id: &'a str,
-            segments: Vec<&'a LifecycleSegment>,
+    /// Creates an immutable input every three newly recorded ticks. Scheduling
+    /// state is persisted so a future async coordinator can coalesce snapshots
+    /// without repeatedly submitting the same tick range.
+    pub(crate) fn schedule_snapshot(
+        &mut self,
+        current_turn_id: &str,
+    ) -> BitFunResult<Option<LifecycleEstimatorSnapshot>> {
+        self.validate()?;
+        if self
+            .latest_tick_seq
+            .saturating_sub(self.last_snapshot_tick_seq)
+            < LIFECYCLE_BATCH_SIZE
+        {
+            return Ok(None);
         }
-        serde_json::to_string(&Input {
-            base_version: self.version,
-            latest_tick_seq: self.latest_tick_seq,
-            current_turn_id,
-            segments: self
-                .segments
-                .values()
-                .filter(|segment| !segment.evicted)
-                .collect(),
-        })
-        .map_err(|error| BitFunError::tool(format!("lifecycle Vi serialization: {error}")))
+        self.create_snapshot(current_turn_id)
     }
 
-    pub(crate) fn apply_delta(&mut self, text: &str) -> BitFunResult<()> {
-        let delta: LifecycleEstimatorDelta = serde_json::from_str(
-            extract_json_object(text)
-                .ok_or_else(|| BitFunError::tool("lifecycle estimator: no JSON object"))?,
-        )
-        .map_err(|error| {
-            BitFunError::tool(format!("lifecycle estimator invalid delta: {error}"))
-        })?;
-        if delta.base_version != self.version {
+    /// Recreates the latest snapshot only when a previous process submitted it
+    /// but never observed a worker result. Completed batches are never replayed.
+    pub(crate) fn schedule_recovery_snapshot(
+        &mut self,
+        current_turn_id: &str,
+    ) -> BitFunResult<Option<LifecycleEstimatorSnapshot>> {
+        self.validate()?;
+        if self.last_snapshot_tick_seq <= self.last_finished_snapshot_tick_seq
+            || self.latest_tick_seq < LIFECYCLE_BATCH_SIZE
+        {
+            return Ok(None);
+        }
+        self.create_snapshot(current_turn_id)
+    }
+
+    pub(crate) fn mark_snapshot_finished(&mut self, snapshot: &LifecycleEstimatorSnapshot) {
+        self.last_finished_snapshot_tick_seq = self
+            .last_finished_snapshot_tick_seq
+            .max(snapshot.created_at_tick);
+        self.registry_revision += 1;
+    }
+
+    fn create_snapshot(
+        &mut self,
+        current_turn_id: &str,
+    ) -> BitFunResult<Option<LifecycleEstimatorSnapshot>> {
+        let current_task_id = self
+            .turn_task_ids
+            .get(current_turn_id)
+            .cloned()
+            .ok_or_else(|| {
+                BitFunError::tool(format!(
+                    "lifecycle snapshot has no task for current turn {current_turn_id}"
+                ))
+            })?;
+        let current_user_prompt = self
+            .tasks
+            .get(&current_task_id)
+            .ok_or_else(|| {
+                BitFunError::tool(format!(
+                    "lifecycle snapshot current task disappeared: {current_task_id}"
+                ))
+            })?
+            .original_user_prompt
+            .clone();
+
+        self.next_snapshot_seq += 1;
+        self.last_snapshot_tick_seq = self.latest_tick_seq;
+        self.registry_revision += 1;
+        let snapshot_id = format!(
+            "lifecycle-snapshot-{}-tick-{}",
+            self.next_snapshot_seq, self.latest_tick_seq
+        );
+        let tasks = self
+            .tasks
+            .values()
+            .map(|task| LifecycleTaskSnapshot {
+                task_id: task.id.clone(),
+                expected_revision: task.revision,
+                title: task.title.clone(),
+                normalized_objective: (task.id != current_task_id
+                    && task.objective != task.original_user_prompt)
+                    .then(|| task.objective.clone()),
+                lifecycle: task.lifecycle,
+                acceptance_criteria: task.acceptance_criteria.clone(),
+                completion_evidence: task.completion_evidence.clone(),
+                unresolved_items: task.unresolved_items.clone(),
+                dependencies: task.dependencies.clone(),
+                last_activity_tick: task.last_activity_tick,
+                segments: task
+                    .segment_ids
+                    .iter()
+                    .filter_map(|segment_id| self.segments.get(segment_id).cloned())
+                    .collect(),
+            })
+            .collect();
+        Ok(Some(LifecycleEstimatorSnapshot {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            snapshot_id,
+            created_at_tick: self.latest_tick_seq,
+            current_turn_id: current_turn_id.to_string(),
+            current_task_id,
+            current_user_prompt,
+            tasks,
+        }))
+    }
+
+    /// Applies independently validated task updates. A stale update is rejected
+    /// by task ID while unrelated updates in the same estimator response remain
+    /// eligible. This is intentionally a pure registry operation: no message,
+    /// artifact, session, or cache mutation is permitted here.
+    pub(crate) fn reduce_estimator_delta(
+        &mut self,
+        snapshot: &LifecycleEstimatorSnapshot,
+        delta: LifecycleEstimatorDelta,
+    ) -> BitFunResult<LifecycleReducerOutcome> {
+        if delta.snapshot_id != snapshot.snapshot_id {
             return Err(BitFunError::tool(format!(
-                "lifecycle estimator stale baseVersion {} (expected {})",
-                delta.base_version, self.version
+                "lifecycle delta snapshot {} does not match {}",
+                delta.snapshot_id, snapshot.snapshot_id
             )));
         }
-        for update in delta.segment_updates {
-            let protected = self.segment_is_protected(&update.segment_id);
-            let Some(segment) = self.segments.get_mut(&update.segment_id) else {
-                warn!(
-                    "lifecycle estimator referenced unknown segment {}, skipping",
-                    update.segment_id
-                );
+        let expected_revisions: BTreeMap<&str, u64> = snapshot
+            .tasks
+            .iter()
+            .map(|task| (task.task_id.as_str(), task.expected_revision))
+            .collect();
+        let mut outcome = LifecycleReducerOutcome::default();
+        for update in delta.task_updates {
+            let Some(snapshot_revision) = expected_revisions.get(update.task_id.as_str()) else {
+                outcome.rejected_updates.push(LifecycleReducerRejection {
+                    task_id: update.task_id,
+                    reason: "unknown_task_for_snapshot".to_string(),
+                });
                 continue;
             };
-            let invalid_completed = update.lifecycle == LifecycleSegmentState::Completed
-                && update.completion_evidence.is_empty();
-            let invalid_evictable = update.lifecycle == LifecycleSegmentState::Evictable
-                && (segment.state != LifecycleSegmentState::Completed
-                    || update.completion_evidence.is_empty()
-                    || !update.unresolved_questions.is_empty()
-                    || protected);
-            if segment.evicted
-                || update.lifecycle < segment.state
-                || invalid_completed
-                || invalid_evictable
-            {
-                warn!(
-                    "lifecycle estimator proposed invalid transition for {}, skipping",
-                    update.segment_id
-                );
+            if *snapshot_revision != update.expected_revision {
+                outcome.rejected_updates.push(LifecycleReducerRejection {
+                    task_id: update.task_id,
+                    reason: "expected_revision_does_not_match_snapshot".to_string(),
+                });
                 continue;
             }
-            segment.state = update.lifecycle;
-            segment.completion_evidence = update.completion_evidence;
-            segment.unresolved_questions = update.unresolved_questions;
+            let Some(current_task) = self.tasks.get(&update.task_id) else {
+                outcome.rejected_updates.push(LifecycleReducerRejection {
+                    task_id: update.task_id,
+                    reason: "task_missing_from_registry".to_string(),
+                });
+                continue;
+            };
+            if current_task.revision != update.expected_revision {
+                outcome.rejected_updates.push(LifecycleReducerRejection {
+                    task_id: update.task_id,
+                    reason: "stale_task_revision".to_string(),
+                });
+                continue;
+            }
+            if current_task.lifecycle == update.lifecycle
+                && current_task.completion_evidence == update.completion_evidence
+                && current_task.unresolved_items == update.unresolved_items
+            {
+                outcome.rejected_updates.push(LifecycleReducerRejection {
+                    task_id: update.task_id,
+                    reason: "no_effective_task_change".to_string(),
+                });
+                continue;
+            }
+            if let Some(reason) = self.rejection_reason_for_update(&update) {
+                outcome.rejected_updates.push(LifecycleReducerRejection {
+                    task_id: update.task_id,
+                    reason,
+                });
+                continue;
+            }
+
+            let task = self
+                .tasks
+                .get_mut(&update.task_id)
+                .expect("task was checked above");
+            task.lifecycle = update.lifecycle;
+            task.completion_evidence = update.completion_evidence;
+            task.unresolved_items = update.unresolved_items;
+            task.revision += 1;
+            self.registry_revision += 1;
+            outcome.applied_task_ids.push(update.task_id);
         }
-        self.version += 1;
-        self.last_estimated_tick_seq = self.latest_tick_seq;
-        Ok(())
+        Ok(outcome)
     }
 
-    pub(crate) fn candidate_segment_ids(&self) -> Vec<String> {
-        self.segments
+    /// Only a task marked evictable by the reducer may be a future physical
+    /// candidate. This phase returns IDs for shadow analysis only.
+    pub(crate) fn shadow_candidate_segment_ids(&self) -> Vec<String> {
+        self.tasks
             .values()
-            .filter(|segment| {
-                segment.state == LifecycleSegmentState::Evictable
-                    && !segment.evicted
-                    && !segment.completion_evidence.is_empty()
-                    && segment.unresolved_questions.is_empty()
-                    && !self.segment_is_protected(&segment.id)
+            .filter(|task| {
+                task.lifecycle == LifecycleTaskState::Evictable
+                    && !self.task_is_deterministically_protected(&task.id)
             })
+            .flat_map(|task| task.segment_ids.iter())
+            .filter_map(|segment_id| self.segments.get(segment_id))
+            .filter(|segment| !segment.evicted)
             .map(|segment| segment.id.clone())
             .collect()
     }
 
-    pub(crate) fn mark_segments_evicted(&mut self, ids: &[String]) {
-        for id in ids {
-            if let Some(segment) = self.segments.get_mut(id) {
-                segment.evicted = true;
+    fn rejection_reason_for_update(&self, update: &LifecycleTaskUpdate) -> Option<String> {
+        let task = self.tasks.get(&update.task_id)?;
+        match (task.lifecycle, update.lifecycle) {
+            (LifecycleTaskState::Active, LifecycleTaskState::Evictable) => {
+                return Some("direct_active_to_evictable_transition".to_string());
+            }
+            (LifecycleTaskState::Completed, LifecycleTaskState::Active)
+            | (LifecycleTaskState::Evictable, LifecycleTaskState::Active)
+            | (LifecycleTaskState::Evictable, LifecycleTaskState::Completed) => {
+                return Some("model_cannot_reopen_or_downgrade_task".to_string());
+            }
+            _ => {}
+        }
+        if update.lifecycle == LifecycleTaskState::Completed
+            && update.completion_evidence.is_empty()
+        {
+            return Some("completed_requires_evidence".to_string());
+        }
+        if update.lifecycle == LifecycleTaskState::Evictable {
+            if update.completion_evidence.is_empty() {
+                return Some("evictable_requires_completion_evidence".to_string());
+            }
+            if !update.unresolved_items.is_empty() {
+                return Some("evictable_has_unresolved_items".to_string());
+            }
+            if self.task_is_deterministically_protected(&update.task_id) {
+                return Some("evictable_task_is_deterministically_protected".to_string());
             }
         }
+        None
     }
 
-    fn segment_is_protected(&self, id: &str) -> bool {
-        let Some(segment) = self.segments.get(id) else {
+    fn task_is_deterministically_protected(&self, task_id: &str) -> bool {
+        let Some(task) = self.tasks.get(task_id) else {
             return true;
         };
-        segment.has_error
-            || segment.has_pending_todo
-            || self.latest_tick_seq.saturating_sub(segment.tick_seq) < RECENT_SEGMENTS_TO_PROTECT
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct LifecycleEvictionPlan {
-    pub(crate) segment_ids: Vec<String>,
-    replacements: Vec<LifecycleReplacement>,
-}
-#[derive(Debug, Clone)]
-struct LifecycleReplacement {
-    segment_id: String,
-    start: usize,
-    end: usize,
-    turn_id: String,
-    tool_names: Vec<String>,
-    completion_evidence: Vec<String>,
-}
-
-impl LifecycleEvictionPlan {
-    pub(crate) fn archive_payloads(
-        &self,
-        messages: &[Message],
-    ) -> BitFunResult<Vec<(String, Vec<Message>)>> {
-        self.replacements
-            .iter()
-            .map(|replacement| {
-                let payload = messages
-                    .get(replacement.start..replacement.end)
-                    .ok_or_else(|| BitFunError::tool("lifecycle archive range became invalid"))?
-                    .to_vec();
-                Ok((replacement.segment_id.clone(), payload))
-            })
-            .collect()
-    }
-    pub(crate) fn apply(
-        &self,
-        messages: &[Message],
-        archives: &HashMap<String, String>,
-    ) -> BitFunResult<Vec<Message>> {
-        let mut rewritten = messages.to_vec();
-        let mut replacements = self.replacements.clone();
-        replacements.sort_by(|a, b| b.start.cmp(&a.start));
-        for replacement in replacements {
-            let archive = archives
-                .get(&replacement.segment_id)
-                .ok_or_else(|| BitFunError::tool("lifecycle archive missing after validation"))?;
-            if replacement.end > rewritten.len() || replacement.start >= replacement.end {
-                return Err(BitFunError::tool(
-                    "lifecycle replacement range became invalid",
-                ));
-            }
-            let summary = format!("[LIFECYCLE_EVICTION segment_id={}]\nTools: {}\nCompletion evidence: {}\nFull segment archive: {}",
-                replacement.segment_id, replacement.tool_names.join(", "), replacement.completion_evidence.join("; "), archive);
-            let reminder =
-                Message::internal_reminder(InternalReminderKind::LifecycleEvictionSummary, summary)
-                    .with_turn_id(replacement.turn_id);
-            rewritten.splice(replacement.start..replacement.end, [reminder]);
-        }
-        Ok(rewritten)
-    }
-}
-
-pub(crate) fn build_eviction_plan(
-    registry: &LifecycleRegistry,
-    messages: &[Message],
-    ids: &[String],
-) -> BitFunResult<LifecycleEvictionPlan> {
-    let mut replacements = Vec::new();
-    for id in ids {
-        let Some(segment) = registry.segments.get(id) else {
-            return Err(BitFunError::tool(format!(
-                "lifecycle candidate disappeared: {id}"
-            )));
-        };
-        if segment.state != LifecycleSegmentState::Evictable
-            || segment.evicted
-            || registry.segment_is_protected(id)
+        if self.latest_tick_seq.saturating_sub(task.last_activity_tick) < RECENT_SEGMENTS_TO_PROTECT
         {
+            return true;
+        }
+        if task
+            .segment_ids
+            .iter()
+            .filter_map(|id| self.segments.get(id))
+            .any(|segment| segment.has_error || segment.has_pending_todo || segment.evicted)
+        {
+            return true;
+        }
+        self.tasks.values().any(|other| {
+            other.id != task_id
+                && other.lifecycle == LifecycleTaskState::Active
+                && other
+                    .dependencies
+                    .iter()
+                    .any(|dependency| dependency == task_id)
+        })
+    }
+
+    /// Converts v1 segment-only state into a safe v2 registry. Legacy records
+    /// are active and cannot be evicted until a new estimator run supplies task
+    /// evidence. No historical user prompt is invented during migration.
+    pub(crate) fn normalize_after_load(&mut self) {
+        if self.schema_version >= REGISTRY_SCHEMA_VERSION
+            && self
+                .segments
+                .values()
+                .all(|segment| !segment.owner_task_id.is_empty())
+        {
+            return;
+        }
+        let segment_ids: Vec<String> = self.segments.keys().cloned().collect();
+        for segment_id in segment_ids {
+            let (turn_id, owner_task_id, tick_seq) = {
+                let segment = self.segments.get(&segment_id).expect("segment exists");
+                (
+                    segment.turn_id.clone(),
+                    segment.owner_task_id.clone(),
+                    segment.tick_seq,
+                )
+            };
+            let owner_task_id = if owner_task_id.is_empty() {
+                let legacy_id = format!("legacy-task:{turn_id}");
+                if !self.tasks.contains_key(&legacy_id) {
+                    self.tasks.insert(
+                        legacy_id.clone(),
+                        LifecycleTask {
+                            id: legacy_id.clone(),
+                            revision: 1,
+                            title: Some("Legacy lifecycle record".to_string()),
+                            original_user_prompt: String::new(),
+                            objective: "Legacy segment-only record; not eligible for eviction until re-estimated.".to_string(),
+                            acceptance_criteria: vec![],
+                            lifecycle: LifecycleTaskState::Active,
+                            covered_turn_ids: vec![turn_id.clone()],
+                            segment_ids: vec![],
+                            completion_evidence: vec![],
+                            unresolved_items: vec![],
+                            dependencies: vec![],
+                            last_activity_tick: tick_seq,
+                        },
+                    );
+                }
+                if let Some(segment) = self.segments.get_mut(&segment_id) {
+                    segment.owner_task_id = legacy_id.clone();
+                }
+                legacy_id
+            } else {
+                owner_task_id
+            };
+            self.turn_task_ids
+                .entry(turn_id)
+                .or_insert_with(|| owner_task_id.clone());
+            let task = self
+                .tasks
+                .entry(owner_task_id.clone())
+                .or_insert_with(|| LifecycleTask {
+                    id: owner_task_id.clone(),
+                    revision: 1,
+                    title: Some("Recovered lifecycle task".to_string()),
+                    original_user_prompt: String::new(),
+                    objective:
+                        "Recovered lifecycle task; not eligible for eviction until re-estimated."
+                            .to_string(),
+                    acceptance_criteria: vec![],
+                    lifecycle: LifecycleTaskState::Active,
+                    covered_turn_ids: vec![],
+                    segment_ids: vec![],
+                    completion_evidence: vec![],
+                    unresolved_items: vec![],
+                    dependencies: vec![],
+                    last_activity_tick: tick_seq,
+                });
+            if !task.segment_ids.contains(&segment_id) {
+                task.segment_ids.push(segment_id);
+            }
+            task.last_activity_tick = task.last_activity_tick.max(tick_seq);
+        }
+        self.schema_version = REGISTRY_SCHEMA_VERSION;
+        self.registry_revision += 1;
+    }
+
+    pub(crate) fn validate(&self) -> BitFunResult<()> {
+        if self.schema_version != REGISTRY_SCHEMA_VERSION {
             return Err(BitFunError::tool(format!(
-                "lifecycle candidate is no longer safe: {id}"
+                "unsupported lifecycle registry schema {}",
+                self.schema_version
             )));
         }
-        let (start, end) = locate_segment(messages, segment)?;
-        replacements.push(LifecycleReplacement {
-            segment_id: id.clone(),
-            start,
-            end,
-            turn_id: segment.turn_id.clone(),
-            tool_names: segment.tool_names.clone(),
-            completion_evidence: segment.completion_evidence.clone(),
-        });
+        for (turn_id, task_id) in &self.turn_task_ids {
+            let task = self.tasks.get(task_id).ok_or_else(|| {
+                BitFunError::tool(format!(
+                    "lifecycle turn {turn_id} references missing task {task_id}"
+                ))
+            })?;
+            if !task.covered_turn_ids.contains(turn_id) {
+                return Err(BitFunError::tool(format!(
+                    "lifecycle task {task_id} does not cover mapped turn {turn_id}"
+                )));
+            }
+        }
+        let mut referenced = BTreeSet::new();
+        for (task_id, task) in &self.tasks {
+            for segment_id in &task.segment_ids {
+                if !referenced.insert(segment_id) {
+                    return Err(BitFunError::tool(format!(
+                        "lifecycle segment {segment_id} belongs to more than one task"
+                    )));
+                }
+                let segment = self.segments.get(segment_id).ok_or_else(|| {
+                    BitFunError::tool(format!(
+                        "lifecycle task {task_id} references missing segment {segment_id}"
+                    ))
+                })?;
+                if segment.owner_task_id != *task_id {
+                    return Err(BitFunError::tool(format!(
+                        "lifecycle segment {segment_id} owner does not match task {task_id}"
+                    )));
+                }
+            }
+        }
+        for (segment_id, segment) in &self.segments {
+            if !self.tasks.contains_key(&segment.owner_task_id) || !referenced.contains(segment_id)
+            {
+                return Err(BitFunError::tool(format!(
+                    "lifecycle segment {segment_id} has no valid task ownership"
+                )));
+            }
+        }
+        Ok(())
     }
-    replacements.sort_by_key(|replacement| replacement.start);
-    if replacements
-        .windows(2)
-        .any(|pair| pair[0].end > pair[1].start)
-    {
-        return Err(BitFunError::tool("lifecycle eviction targets overlap"));
+
+    fn ensure_task_for_turn(&mut self, turn_id: &str) -> String {
+        self.turn_task_ids
+            .get(turn_id)
+            .cloned()
+            .unwrap_or_else(|| self.observe_user_turn(turn_id, ""))
     }
-    (!replacements.is_empty())
-        .then_some(LifecycleEvictionPlan {
-            segment_ids: ids.to_vec(),
-            replacements,
+}
+
+/// Reads the actual user input for one dialog turn. Internal reminders are not
+/// a user-task source even though some are represented as user-role messages.
+pub(crate) fn actual_user_prompt(messages: &[Message], turn_id: &str) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message.metadata.turn_id.as_deref() == Some(turn_id) && message.is_actual_user_message()
         })
-        .ok_or_else(|| BitFunError::tool("lifecycle eviction has no targets"))
+        .and_then(|message| match &message.content {
+            MessageContent::Text(text) | MessageContent::Multimodal { text, .. } => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
 }
 
-fn locate_segment(
-    messages: &[Message],
-    segment: &LifecycleSegment,
-) -> BitFunResult<(usize, usize)> {
-    let start = messages.iter().position(|message| message.metadata.turn_id.as_deref() == Some(segment.turn_id.as_str())
-        && matches!(&message.content, MessageContent::Mixed { tool_calls, .. } if tool_calls.iter().map(|call| &call.tool_id).eq(segment.tool_call_ids.iter())))
-        .ok_or_else(|| BitFunError::tool(format!("lifecycle segment cannot be relocated: {}", segment.id)))?;
-    let mut end = start + 1;
-    let mut result_ids = Vec::new();
-    while let Some(message) = messages.get(end) {
-        let MessageContent::ToolResult { tool_id, .. } = &message.content else {
-            break;
-        };
-        result_ids.push(tool_id.clone());
-        end += 1;
-    }
-    if result_ids != segment.tool_call_ids {
-        return Err(BitFunError::tool(format!(
-            "lifecycle result IDs changed: {}",
-            segment.id
-        )));
-    }
-    Ok((start, end))
-}
-
-pub(crate) async fn estimate_registry_delta(vi_json: String) -> BitFunResult<String> {
-    use crate::infrastructure::ai::get_global_ai_client_factory;
-    const PROMPT: &str = r#"You are a conservative lifecycle estimator for an agent tool loop. Return ONLY JSON: {"baseVersion": number, "segmentUpdates": [{"segmentId": string, "lifecycle": "active"|"completed"|"evictable", "completionEvidence": [string], "unresolvedQuestions": [string]}]}. A segment is one assistant tool-call group plus results. Judge residual utility from later segments. completed needs concrete evidence. evictable requires completed evidence, no unresolved questions, and must never be one of the two newest segments. Do not invent segment IDs. Prefer active or completed when uncertain."#;
-    let factory = get_global_ai_client_factory()
-        .await
-        .map_err(|error| BitFunError::AIClient(format!("lifecycle estimator factory: {error}")))?;
-    let client = factory
-        .get_client_resolved("fast")
-        .await
-        .map_err(|error| BitFunError::AIClient(format!("lifecycle estimator client: {error}")))?;
-    let response = client
-        .send_message_with_trace(
-            vec![
-                AIMessage::system(PROMPT.to_string()),
-                AIMessage::user(vi_json),
-            ],
-            None,
-            None,
-        )
-        .await
-        .map_err(|error| BitFunError::AIClient(format!("lifecycle estimator request: {error}")))?;
-    Ok(response.text)
+fn result_fact(message: &Message) -> Option<LifecycleResultFact> {
+    let MessageContent::ToolResult {
+        tool_id,
+        tool_name,
+        result_for_assistant,
+        is_error,
+        ..
+    } = &message.content
+    else {
+        return None;
+    };
+    let content = result_for_assistant.as_deref().unwrap_or("");
+    let content_sha256 = format!("{:x}", Sha256::digest(content.as_bytes()));
+    Some(LifecycleResultFact {
+        tool_id: tool_id.clone(),
+        tool_name: tool_name.clone(),
+        is_error: *is_error,
+        char_count: content.chars().count(),
+        content_sha256,
+        preview: truncate_chars(content, RESULT_PREVIEW_CHARS),
+    })
 }
 
 fn todo_call_has_pending_items(call: &ToolCall) -> bool {
@@ -417,19 +995,13 @@ fn todo_call_has_pending_items(call: &ToolCall) -> bool {
                 })
             })
 }
-fn message_char_estimate(message: &Message) -> usize {
-    match &message.content {
-        MessageContent::ToolResult {
-            result_for_assistant,
-            ..
-        } => result_for_assistant
-            .as_deref()
-            .unwrap_or("")
-            .chars()
-            .count(),
-        _ => 0,
-    }
+
+fn extract_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    (end >= start).then_some(&text[start..=end])
 }
+
 pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
     let mut chars = s.chars();
     let out: String = chars.by_ref().take(max).collect();
@@ -439,21 +1011,77 @@ pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
         out
     }
 }
-fn extract_json_object(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    (end >= start).then_some(&text[start..=end])
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agentic::core::message::ToolResult;
+
+    struct TestWorker {
+        receivers:
+            std::sync::Mutex<std::collections::VecDeque<tokio::sync::oneshot::Receiver<String>>>,
+    }
+
+    impl TestWorker {
+        fn new(receiver: tokio::sync::oneshot::Receiver<String>) -> Self {
+            Self {
+                receivers: std::sync::Mutex::new(std::collections::VecDeque::from([receiver])),
+            }
+        }
+    }
+
+    impl LifecycleEstimatorWorker for TestWorker {
+        fn spawn(&self, snapshot: LifecycleEstimatorSnapshot) -> LifecycleInflightJob {
+            let receiver = self
+                .receivers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("test worker was asked to start without a queued response");
+            spawn_lifecycle_worker(snapshot, move |_| async move {
+                receiver.await.map_err(|error| error.to_string())
+            })
+        }
+    }
+
+    struct AbortAwareFuture {
+        aborted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl std::future::Future for AbortAwareFuture {
+        type Output = Result<String, String>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for AbortAwareFuture {
+        fn drop(&mut self) {
+            self.aborted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    struct PendingWorker {
+        aborted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl LifecycleEstimatorWorker for PendingWorker {
+        fn spawn(&self, snapshot: LifecycleEstimatorSnapshot) -> LifecycleInflightJob {
+            let aborted = self.aborted.clone();
+            spawn_lifecycle_worker(snapshot, move |_| AbortAwareFuture { aborted })
+        }
+    }
+
     fn round(turn: &str, suffix: &str, error: bool, pending: bool) -> Vec<Message> {
         let mut calls = vec![ToolCall {
-            tool_id: format!("{suffix}-id"),
+            tool_id: format!("{suffix}-read"),
             tool_name: "Read".into(),
-            arguments: serde_json::json!({}),
+            arguments: serde_json::json!({"file_path":"src/lib.rs"}),
             ..Default::default()
         }];
         if pending {
@@ -467,7 +1095,7 @@ mod tests {
         vec![
             Message::assistant_with_tools("inspect".into(), calls).with_turn_id(turn.into()),
             Message::tool_result(ToolResult {
-                tool_id: format!("{suffix}-id"),
+                tool_id: format!("{suffix}-read"),
                 tool_name: "Read".into(),
                 result: serde_json::json!({}),
                 result_for_assistant: Some("full result".into()),
@@ -478,82 +1106,496 @@ mod tests {
             .with_turn_id(turn.into()),
         ]
     }
-    fn delta(version: u64, id: &str, state: &str, evidence: &[&str]) -> String {
-        serde_json::json!({"baseVersion":version,"segmentUpdates":[{"segmentId":id,"lifecycle":state,"completionEvidence":evidence,"unresolvedQuestions":[]}]}).to_string()
-    }
+
     #[test]
-    fn batch_is_counted_by_tool_ticks_not_outer_turn() {
-        let mut r = LifecycleRegistry::default();
-        for i in 0..3 {
-            let m = round("same-user-turn", &i.to_string(), false, false);
-            r.record_segment(&m, 0, 2, "same-user-turn");
+    fn preserves_full_user_prompt_and_assigns_a_provisional_task() {
+        let mut registry = LifecycleRegistry::default();
+        let prompt = format!("objective {}", "x".repeat(2_000));
+        let task_id = registry.observe_user_turn("turn-1", &prompt);
+        let task = &registry.tasks[&task_id];
+        assert_eq!(task.original_user_prompt, prompt);
+        assert_eq!(task.objective, prompt);
+        assert_eq!(task.lifecycle, LifecycleTaskState::Active);
+        registry.validate().unwrap();
+    }
+
+    #[test]
+    fn records_segments_under_task_without_reasoning_content() {
+        let mut registry = LifecycleRegistry::default();
+        registry.observe_user_turn("turn-1", "fix the parser");
+        let messages = round("turn-1", "one", false, false);
+        let segment_id = registry.record_segment(&messages, 0, 2, "turn-1").unwrap();
+        let segment = &registry.segments[&segment_id];
+        let task = &registry.tasks[&segment.owner_task_id];
+        assert_eq!(task.segment_ids, vec![segment_id.clone()]);
+        assert_eq!(segment.tool_facts[0].tool_name, "Read");
+        assert_eq!(segment.result_facts[0].preview, "full result");
+        assert_eq!(registry.latest_tick_seq, 1);
+        registry.validate().unwrap();
+    }
+
+    #[test]
+    fn duplicate_recording_is_idempotent() {
+        let mut registry = LifecycleRegistry::default();
+        let messages = round("turn-1", "one", false, false);
+        let first = registry.record_segment(&messages, 0, 2, "turn-1").unwrap();
+        let second = registry.record_segment(&messages, 0, 2, "turn-1").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(registry.latest_tick_seq, 1);
+        assert_eq!(registry.segments.len(), 1);
+        registry.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_segment_only_registry_becomes_active_and_safe() {
+        let mut registry: LifecycleRegistry = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "latest_tick_seq": 3,
+            "segments": {
+                "legacy": {
+                    "id": "legacy",
+                    "turn_id": "turn-1",
+                    "tick_seq": 3,
+                    "tool_call_ids": ["call-1"],
+                    "tool_names": ["Read"],
+                    "has_error": false,
+                    "has_pending_todo": false,
+                    "token_estimate": 10,
+                    "state": "evictable",
+                    "completion_evidence": ["old data"],
+                    "unresolved_questions": [],
+                    "evicted": false
+                }
+            }
+        }))
+        .unwrap();
+        registry.normalize_after_load();
+        let segment = &registry.segments["legacy"];
+        let task = &registry.tasks[&segment.owner_task_id];
+        assert_eq!(task.lifecycle, LifecycleTaskState::Active);
+        assert!(task.completion_evidence.is_empty());
+        registry.validate().unwrap();
+    }
+
+    #[test]
+    fn captures_error_and_pending_todo_as_deterministic_facts() {
+        let mut registry = LifecycleRegistry::default();
+        let messages = round("turn-1", "one", true, true);
+        let id = registry.record_segment(&messages, 0, 2, "turn-1").unwrap();
+        let segment = &registry.segments[&id];
+        assert!(segment.has_error);
+        assert!(segment.has_pending_todo);
+        registry.validate().unwrap();
+    }
+
+    #[test]
+    fn extracts_only_actual_user_input_for_the_requested_turn() {
+        let messages = vec![
+            Message::user("ignore this internal text".into())
+                .with_turn_id("turn-1".into())
+                .with_internal_reminder_kind(
+                    crate::agentic::core::message::InternalReminderKind::Generic,
+                ),
+            Message::user("keep the complete user objective".into())
+                .with_turn_id("turn-1".into())
+                .with_semantic_kind(
+                    crate::agentic::core::message::MessageSemanticKind::ActualUserInput,
+                ),
+        ];
+        assert_eq!(
+            actual_user_prompt(&messages, "turn-1").as_deref(),
+            Some("keep the complete user objective")
+        );
+    }
+
+    #[test]
+    fn v2_registry_round_trip_preserves_task_ownership_and_full_prompt() {
+        let mut registry = LifecycleRegistry::default();
+        let prompt = format!("implement all requirements {}", "q".repeat(1_500));
+        registry.observe_user_turn("turn-1", &prompt);
+        let messages = round("turn-1", "one", false, false);
+        registry.record_segment(&messages, 0, 2, "turn-1");
+
+        let mut restored: LifecycleRegistry =
+            serde_json::from_value(serde_json::to_value(&registry).unwrap()).unwrap();
+        restored.normalize_after_load();
+        restored.validate().unwrap();
+        let task = restored.tasks.get("task:turn-1").unwrap();
+        assert_eq!(task.original_user_prompt, prompt);
+        assert_eq!(task.segment_ids.len(), 1);
+    }
+
+    fn update(
+        task_id: &str,
+        expected_revision: u64,
+        lifecycle: LifecycleTaskState,
+        evidence: &[&str],
+    ) -> LifecycleTaskUpdate {
+        LifecycleTaskUpdate {
+            task_id: task_id.to_string(),
+            expected_revision,
+            lifecycle,
+            completion_evidence: evidence.iter().map(|value| (*value).to_string()).collect(),
+            unresolved_items: vec![],
         }
-        assert_eq!(r.latest_tick_seq, 3);
-        assert!(r.should_estimate());
     }
+
+    fn snapshot_with_two_tasks() -> (
+        LifecycleRegistry,
+        LifecycleEstimatorSnapshot,
+        String,
+        String,
+    ) {
+        let mut registry = LifecycleRegistry::default();
+        let old_prompt = format!("old objective {}", "a".repeat(1_300));
+        let current_prompt = format!("current objective {}", "b".repeat(1_500));
+        registry.observe_user_turn("turn-1", &old_prompt);
+        for suffix in ["one", "two"] {
+            let messages = round("turn-1", suffix, false, false);
+            registry.record_segment(&messages, 0, 2, "turn-1");
+        }
+        registry.observe_user_turn("turn-2", &current_prompt);
+        let messages = round("turn-2", "three", false, false);
+        registry.record_segment(&messages, 0, 2, "turn-2");
+        let snapshot = registry.schedule_snapshot("turn-2").unwrap().unwrap();
+        (registry, snapshot, old_prompt, current_prompt)
+    }
+
     #[test]
-    fn old_segment_can_be_evicted_inside_current_user_turn() {
-        let mut r = LifecycleRegistry::default();
-        let mut all = Vec::new();
-        let mut ids = Vec::new();
-        for i in 0..4 {
-            let m = round("same-user-turn", &i.to_string(), false, false);
-            let start = all.len();
-            all.extend(m);
-            ids.push(
-                r.record_segment(&all, start, start + 2, "same-user-turn")
-                    .unwrap(),
+    fn snapshot_runs_per_three_ticks_and_only_repeats_current_raw_prompt() {
+        let (mut registry, snapshot, old_prompt, current_prompt) = snapshot_with_two_tasks();
+        assert_eq!(snapshot.created_at_tick, 3);
+        assert_eq!(snapshot.current_user_prompt, current_prompt);
+        assert_eq!(snapshot.tasks.len(), 2);
+        assert!(snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "task:turn-1")
+            .unwrap()
+            .normalized_objective
+            .is_none());
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        assert!(!serialized.contains(&old_prompt));
+        assert!(!serialized.contains("reasoning_content"));
+        assert!(registry.schedule_snapshot("turn-2").unwrap().is_none());
+    }
+
+    #[test]
+    fn unfinished_snapshot_is_recovered_once_after_restart() {
+        let (mut registry, first_snapshot, _, _) = snapshot_with_two_tasks();
+        assert_eq!(registry.last_snapshot_tick_seq, 3);
+        assert_eq!(registry.last_finished_snapshot_tick_seq, 0);
+
+        let recovery_snapshot = registry
+            .schedule_recovery_snapshot("turn-2")
+            .unwrap()
+            .unwrap();
+        assert_ne!(recovery_snapshot.snapshot_id, first_snapshot.snapshot_id);
+        assert_eq!(
+            recovery_snapshot.created_at_tick,
+            first_snapshot.created_at_tick
+        );
+        registry.mark_snapshot_finished(&recovery_snapshot);
+        assert_eq!(registry.last_finished_snapshot_tick_seq, 3);
+        assert!(registry
+            .schedule_recovery_snapshot("turn-2")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn stale_task_update_does_not_discard_fresh_update_for_another_task() {
+        let (mut registry, snapshot, _, _) = snapshot_with_two_tasks();
+        let old_revision = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "task:turn-1")
+            .unwrap()
+            .expected_revision;
+        let current_revision = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "task:turn-2")
+            .unwrap()
+            .expected_revision;
+
+        let messages = round("turn-1", "after-snapshot", false, false);
+        registry.record_segment(&messages, 0, 2, "turn-1");
+        let outcome = registry
+            .reduce_estimator_delta(
+                &snapshot,
+                LifecycleEstimatorDelta {
+                    snapshot_id: snapshot.snapshot_id.clone(),
+                    task_updates: vec![
+                        update(
+                            "task:turn-1",
+                            old_revision,
+                            LifecycleTaskState::Completed,
+                            &["old task done"],
+                        ),
+                        update(
+                            "task:turn-2",
+                            current_revision,
+                            LifecycleTaskState::Completed,
+                            &["current task done"],
+                        ),
+                    ],
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome.applied_task_ids, vec!["task:turn-2"]);
+        assert_eq!(outcome.rejected_updates[0].reason, "stale_task_revision");
+        assert_eq!(
+            registry.tasks["task:turn-2"].lifecycle,
+            LifecycleTaskState::Completed
+        );
+        assert_eq!(
+            registry.tasks["task:turn-1"].lifecycle,
+            LifecycleTaskState::Active
+        );
+    }
+
+    #[test]
+    fn reducer_rejects_direct_active_to_evictable_transition() {
+        let (mut registry, snapshot, _, _) = snapshot_with_two_tasks();
+        let revision = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "task:turn-1")
+            .unwrap()
+            .expected_revision;
+        let outcome = registry
+            .reduce_estimator_delta(
+                &snapshot,
+                LifecycleEstimatorDelta {
+                    snapshot_id: snapshot.snapshot_id.clone(),
+                    task_updates: vec![update(
+                        "task:turn-1",
+                        revision,
+                        LifecycleTaskState::Evictable,
+                        &["not enough"],
+                    )],
+                },
+            )
+            .unwrap();
+        assert!(outcome.applied_task_ids.is_empty());
+        assert_eq!(
+            outcome.rejected_updates[0].reason,
+            "direct_active_to_evictable_transition"
+        );
+    }
+
+    #[test]
+    fn completed_old_task_becomes_a_shadow_candidate_only_after_guards_pass() {
+        let (mut registry, first_snapshot, _, _) = snapshot_with_two_tasks();
+        let first_revision = first_snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "task:turn-1")
+            .unwrap()
+            .expected_revision;
+        registry
+            .reduce_estimator_delta(
+                &first_snapshot,
+                LifecycleEstimatorDelta {
+                    snapshot_id: first_snapshot.snapshot_id.clone(),
+                    task_updates: vec![update(
+                        "task:turn-1",
+                        first_revision,
+                        LifecycleTaskState::Completed,
+                        &["inspection finished"],
+                    )],
+                },
+            )
+            .unwrap();
+
+        for suffix in ["four", "five", "six"] {
+            let messages = round("turn-2", suffix, false, false);
+            registry.record_segment(&messages, 0, 2, "turn-2");
+        }
+        let second_snapshot = registry.schedule_snapshot("turn-2").unwrap().unwrap();
+        let first_revision = second_snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "task:turn-1")
+            .unwrap()
+            .expected_revision;
+        let outcome = registry
+            .reduce_estimator_delta(
+                &second_snapshot,
+                LifecycleEstimatorDelta {
+                    snapshot_id: second_snapshot.snapshot_id.clone(),
+                    task_updates: vec![update(
+                        "task:turn-1",
+                        first_revision,
+                        LifecycleTaskState::Evictable,
+                        &["inspection finished"],
+                    )],
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome.applied_task_ids, vec!["task:turn-1"]);
+        assert_eq!(
+            registry.shadow_candidate_segment_ids(),
+            vec!["turn-1:one-read".to_string(), "turn-1:two-read".to_string()]
+        );
+    }
+
+    #[test]
+    fn deterministic_error_or_pending_todo_prevents_evictable_transition() {
+        for (error, pending) in [(true, false), (false, true)] {
+            let mut registry = LifecycleRegistry::default();
+            registry.observe_user_turn("turn-1", "risky task");
+            let messages = round("turn-1", "one", error, pending);
+            registry.record_segment(&messages, 0, 2, "turn-1");
+            for suffix in ["two", "three", "four", "five", "six"] {
+                registry.observe_user_turn("turn-2", "other task");
+                let messages = round("turn-2", suffix, false, false);
+                registry.record_segment(&messages, 0, 2, "turn-2");
+            }
+            let snapshot = registry.schedule_snapshot("turn-2").unwrap().unwrap();
+            let task_one_revision = snapshot
+                .tasks
+                .iter()
+                .find(|task| task.task_id == "task:turn-1")
+                .unwrap()
+                .expected_revision;
+            registry
+                .reduce_estimator_delta(
+                    &snapshot,
+                    LifecycleEstimatorDelta {
+                        snapshot_id: snapshot.snapshot_id.clone(),
+                        task_updates: vec![update(
+                            "task:turn-1",
+                            task_one_revision,
+                            LifecycleTaskState::Completed,
+                            &["finished despite bad intermediate result"],
+                        )],
+                    },
+                )
+                .unwrap();
+            let next_snapshot = registry.schedule_snapshot("turn-2").unwrap();
+            assert!(next_snapshot.is_none());
+            let task_one_revision = registry.tasks["task:turn-1"].revision;
+            let synthetic_snapshot = LifecycleEstimatorSnapshot {
+                schema_version: REGISTRY_SCHEMA_VERSION,
+                snapshot_id: "test-snapshot".to_string(),
+                created_at_tick: registry.latest_tick_seq,
+                current_turn_id: "turn-2".to_string(),
+                current_task_id: "task:turn-2".to_string(),
+                current_user_prompt: "other task".to_string(),
+                tasks: vec![LifecycleTaskSnapshot {
+                    task_id: "task:turn-1".to_string(),
+                    expected_revision: task_one_revision,
+                    title: None,
+                    normalized_objective: None,
+                    lifecycle: LifecycleTaskState::Completed,
+                    acceptance_criteria: vec![],
+                    completion_evidence: vec![
+                        "finished despite bad intermediate result".to_string()
+                    ],
+                    unresolved_items: vec![],
+                    dependencies: vec![],
+                    last_activity_tick: 1,
+                    segments: vec![],
+                }],
+            };
+            let outcome = registry
+                .reduce_estimator_delta(
+                    &synthetic_snapshot,
+                    LifecycleEstimatorDelta {
+                        snapshot_id: "test-snapshot".to_string(),
+                        task_updates: vec![update(
+                            "task:turn-1",
+                            task_one_revision,
+                            LifecycleTaskState::Evictable,
+                            &["finished despite bad intermediate result"],
+                        )],
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                outcome.rejected_updates[0].reason,
+                "evictable_task_is_deterministically_protected"
             );
         }
-        r.apply_delta(&delta(0, &ids[0], "completed", &["read complete"]))
-            .unwrap();
-        r.apply_delta(&delta(1, &ids[0], "evictable", &["read complete"]))
-            .unwrap();
-        assert_eq!(r.candidate_segment_ids(), vec![ids[0].clone()]);
-        let plan = build_eviction_plan(&r, &all, &[ids[0].clone()]).unwrap();
-        let archives = HashMap::from([(ids[0].clone(), "/tmp/archive.json".into())]);
-        let rewritten = plan.apply(&all, &archives).unwrap();
-        assert_eq!(rewritten.len(), 7);
-        assert!(matches!(
-            rewritten[0].metadata.internal_reminder_kind,
-            Some(InternalReminderKind::LifecycleEvictionSummary)
-        ));
     }
-    #[test]
-    fn rejects_direct_eviction_and_protected_error_or_todo() {
-        let mut r = LifecycleRegistry::default();
-        let m = round("turn", "one", false, false);
-        let id = r.record_segment(&m, 0, 2, "turn").unwrap();
-        r.apply_delta(&delta(0, &id, "evictable", &["done"]))
+
+    #[tokio::test]
+    async fn scheduler_poll_is_nonblocking_until_worker_has_completed() {
+        let (_, snapshot, _, _) = snapshot_with_two_tasks();
+        let (sender, receiver) = tokio::sync::oneshot::channel::<String>();
+        let mut scheduler =
+            LifecycleEstimatorScheduler::new(std::sync::Arc::new(TestWorker::new(receiver)));
+        assert_eq!(
+            scheduler.submit("session-1", snapshot.clone()),
+            LifecycleScheduleDisposition::Started
+        );
+        assert!(scheduler.poll_ready("session-1").await.is_none());
+        sender
+            .send("{\"snapshotId\":\"ok\",\"taskUpdates\":[]}".to_string())
             .unwrap();
-        assert_eq!(r.segments[&id].state, LifecycleSegmentState::Active);
-        for (error, pending) in [(true, false), (false, true)] {
-            let mut r = LifecycleRegistry::default();
-            let m = round("turn", "x", error, pending);
-            let id = r.record_segment(&m, 0, 2, "turn").unwrap();
-            r.latest_tick_seq = 3;
-            r.apply_delta(&delta(0, &id, "completed", &["done"]))
-                .unwrap();
-            r.apply_delta(&delta(1, &id, "evictable", &["done"]))
-                .unwrap();
-            assert!(r.candidate_segment_ids().is_empty());
-        }
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(result) = scheduler.poll_ready("session-1").await {
+                    return result;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed local worker should be observed without network");
+        assert_eq!(result.snapshot.snapshot_id, snapshot.snapshot_id);
+        assert!(result.response.is_ok());
+        assert!(!scheduler.has_work("session-1"));
     }
+
+    #[tokio::test]
+    async fn scheduler_coalesces_newer_snapshot_while_one_is_inflight() {
+        let (_, first_snapshot, _, _) = snapshot_with_two_tasks();
+        let mut second_snapshot = first_snapshot.clone();
+        second_snapshot.snapshot_id = "newer-snapshot".to_string();
+        let (_sender, receiver) = tokio::sync::oneshot::channel::<String>();
+        let mut scheduler =
+            LifecycleEstimatorScheduler::new(std::sync::Arc::new(TestWorker::new(receiver)));
+        scheduler.submit("session-1", first_snapshot);
+        assert_eq!(
+            scheduler.submit("session-1", second_snapshot),
+            LifecycleScheduleDisposition::Coalesced
+        );
+        assert!(scheduler.has_work("session-1"));
+        // Dropping the scheduler aborts the local test worker. The pending
+        // snapshot must not start a real estimator request in this test.
+    }
+
+    #[tokio::test]
+    async fn dropping_scheduler_aborts_unfinished_worker() {
+        let (_, snapshot, _, _) = snapshot_with_two_tasks();
+        let aborted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut scheduler = LifecycleEstimatorScheduler::new(std::sync::Arc::new(PendingWorker {
+            aborted: aborted.clone(),
+        }));
+        scheduler.submit("session-1", snapshot);
+        tokio::task::yield_now().await;
+        drop(scheduler);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !aborted.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping a scheduler must abort its unfinished worker");
+    }
+
     #[test]
-    fn rejects_changed_result_id() {
-        let mut r = LifecycleRegistry::default();
-        let mut m = round("turn", "one", false, false);
-        let id = r.record_segment(&m, 0, 2, "turn").unwrap();
-        r.latest_tick_seq = 3;
-        r.segments.get_mut(&id).unwrap().state = LifecycleSegmentState::Evictable;
-        r.segments
-            .get_mut(&id)
-            .unwrap()
-            .completion_evidence
-            .push("done".into());
-        if let MessageContent::ToolResult { tool_id, .. } = &mut m[1].content {
-            *tool_id = "changed".into();
-        }
-        assert!(build_eviction_plan(&r, &m, &[id]).is_err());
+    fn parser_accepts_fenced_json_and_rejects_non_json() {
+        let parsed = parse_estimator_delta(
+            "```json\n{\"snapshotId\":\"snapshot-1\",\"taskUpdates\":[]}\n```",
+        )
+        .unwrap();
+        assert_eq!(parsed.snapshot_id, "snapshot-1");
+        assert!(parse_estimator_delta("not a delta").is_err());
     }
 }

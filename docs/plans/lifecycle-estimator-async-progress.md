@@ -2,6 +2,35 @@
 
 Updated: 2026-08-06
 
+## SWE-bench adaptation plan
+
+The original model treated one dialog turn as one lifecycle task. That is safe
+but ineffective for SWE-bench: one user prompt commonly contains dozens of
+tool rounds, so the task remains recent for the whole trajectory.
+
+1. Keep a root objective for the complete user prompt and add work units below
+   it. A work unit is initially created from one Todo ID; a no-Todo fallback
+   remains attached to the root and is never evictable.
+2. Maintain a latest Todo ledger. Historical `pending` values are facts only;
+   protection follows the latest status. TodoWrite/control segments stay pinned
+   to the root because they contain the plan for later work.
+3. Assign ordinary tool segments to the unique current `in_progress` Todo. If
+   assignment is ambiguous, keep the segment on the non-evictable root. The
+   model cannot arbitrarily reassign segments in this phase.
+4. Update snapshots, reducer revisions, protection reasons, and traces to name
+   work units and expose the Todo/control decision. Physical eviction remains
+   disabled.
+5. Replay a real SWE-bench snapshot and require an old completed work unit to
+   become a candidate only when its Todo is currently complete, it is outside
+   the recent window, and no dependency/error guard applies.
+6. Only after this produces explainable candidates design artifact-backed
+   physical apply and recovery. Shadow mode does not measure token/cache or
+   quality effects.
+
+Trajectories without reliable Todo structure remain shadow-only and produce
+fewer candidates until a separately validated model-assisted segmentation phase
+is added.
+
 ## Scope and terminology
 
 This branch adapts the lifecycle portion of TokenPilot to BitFun. It implements
@@ -11,11 +40,57 @@ delete, replace, archive, or summarize context messages.
 - A **dialog turn** is one actual user input with a `dialog_turn_id`.
 - A **tick** is one completed assistant tool-call group plus its tool results.
 - A **segment** is the message range that could eventually be replaced.
-- A **task** is a user objective spanning one or more segments. Lifecycle state
-  belongs to the task, not directly to a segment.
+- A **root objective** is one complete user input and is retained.
+- A **work unit** is an intra-turn Todo-derived task spanning one or more
+  segments. Lifecycle state belongs to the work unit, not directly to a segment.
 
 The scheduler cadence is fixed at three ticks. A candidate may refer to an
 older task, not only to the three ticks that caused a new snapshot.
+
+## Phase 5: SWE-bench work-unit adaptation
+
+Status: implementation complete and unit/regression tested; live benchmark
+shadow trace pending.
+
+Implemented so far:
+
+- Registry schema v3 retains one root work unit per dialog turn and creates a
+  Todo-derived work unit only for a unique current `in_progress` Todo.
+- TodoWrite segments are control context and remain owned by the root, even
+  when the write fails. Ordinary later tool rounds follow the active Todo.
+- The persisted Todo ledger follows only successful TodoWrite results. A later
+  `completed` status removes the Todo protection; an earlier `pending` status
+  remains audit data rather than a permanent eviction ban.
+- A successful whole-list TodoWrite retains omitted historical items for
+  ownership validation. Omitted unfinished items become conservatively
+  `cancelled`; omitted completed items stay `completed`.
+- No-Todo and ambiguous-Todo trajectories stay on the root fallback and cannot
+  become candidates. This is intentionally conservative.
+- Snapshot task records now expose root ID, work-unit source, control flag, and
+  linked Todo IDs. Completed traces include protection reasons for every work
+  unit.
+
+Errors found and fixed during this phase:
+
+- Initial schema additions left six constructors incomplete; `cargo check`
+  reported each missing field before behavior tests were run.
+- A TodoWrite request was initially admitted from request arguments even when
+  its tool result failed. The ledger now requires a matching successful result.
+- Failed TodoWrite was initially not treated as a retained control segment.
+  It is now pinned to the root and cannot contaminate an active Todo unit.
+- Whole-list replacement initially removed an omitted Todo that an older work
+  unit still referenced. A targeted test caught the resulting registry
+  validation failure. The ledger now retains the audit item and blocks its
+  work unit by marking an omitted unfinished item `cancelled`.
+
+Remaining limitations:
+
+- Tool-error protection remains task-wide and conservative. A resolved earlier
+  error still prevents eviction until a separate, evidence-backed resolution
+  mechanism is designed.
+- Work-unit dependencies are only consumed if supplied by the estimator; this
+  phase does not infer cross-Todo dependencies deterministically.
+- This phase does not read raw assistant reasoning or enable physical eviction.
 
 ## Phase 1: deterministic task and segment facts
 
@@ -127,16 +202,23 @@ Implemented behavior:
 
 ## Verification record
 
-Passed:
+Earlier checkpoint, before Phase 5:
 
 - `cargo test --offline -p bitfun-core lifecycle_evict --lib`: 17 passed,
   0 failed. Coverage includes full-prompt preservation, ownership, idempotence,
   v1 migration, per-task stale rejection, legal transitions, deterministic
   guards, scheduler non-blocking/coalescing/cancellation, parser handling, and
   restart recovery.
-- `cargo test --offline -p bitfun-core --lib`: 1008 passed, 0 failed,
-  1 ignored, after allowing Canvas tests to create their normal temporary
-  directories under `~/.bitfun`.
+Current Phase 5 verification:
+
+- `cargo test --offline -p bitfun-core lifecycle_evict --lib`: 25 passed,
+  0 failed. Added coverage proves Todo control ownership, result-gated ledger
+  updates, generated Todo IDs, whole-list omitted-item handling, ambiguous/no-Todo
+  fallback protection, completed Todo candidate eligibility during later
+  intra-turn work, and estimator snapshot input for the active Todo work unit.
+- `cargo test --offline -p bitfun-core --lib`: 1016 passed, 0 failed,
+  1 ignored after the final ledger fix.
+- `cargo check --offline -p bitfun-cli -q` after Phase 5: passed.
 
 Initially failed, then resolved as environment permission rather than code:
 

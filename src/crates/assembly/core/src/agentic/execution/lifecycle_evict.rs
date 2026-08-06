@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 
 pub(crate) const LIFECYCLE_REGISTRY_METADATA_KEY: &str = "lifecycleEvictionRegistry";
 
-const REGISTRY_SCHEMA_VERSION: u32 = 2;
+const REGISTRY_SCHEMA_VERSION: u32 = 3;
 const RESULT_PREVIEW_CHARS: usize = 600;
 const LIFECYCLE_BATCH_SIZE: u64 = 3;
 const RECENT_SEGMENTS_TO_PROTECT: u64 = 2;
@@ -28,7 +28,8 @@ fn default_schema_version() -> u32 {
     REGISTRY_SCHEMA_VERSION
 }
 
-/// Lifecycle state belongs to a task. A segment is only the eventual physical
+/// Lifecycle state belongs to an intra-turn work unit. A root objective and its
+/// control segments are retained; a segment is only the eventual physical
 /// replacement unit and must not independently become evictable.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +37,44 @@ pub(crate) enum LifecycleTaskState {
     Active,
     Completed,
     Evictable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LifecycleWorkUnitSource {
+    RootFallback,
+    Todo,
+}
+
+impl Default for LifecycleWorkUnitSource {
+    fn default() -> Self {
+        Self::RootFallback
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LifecycleTodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Cancelled,
+}
+
+impl Default for LifecycleTodoStatus {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct LifecycleTodoItem {
+    pub(crate) key: String,
+    pub(crate) todo_id: String,
+    pub(crate) root_task_id: String,
+    pub(crate) content: String,
+    pub(crate) status: LifecycleTodoStatus,
+    pub(crate) last_update_tick: u64,
 }
 
 impl Default for LifecycleTaskState {
@@ -47,6 +86,16 @@ impl Default for LifecycleTaskState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct LifecycleTask {
     pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) root_task_id: String,
+    #[serde(default)]
+    pub(crate) source: LifecycleWorkUnitSource,
+    /// Todo work units are evictable candidates; root/control work units are
+    /// retained because they carry the user objective or execution plan.
+    #[serde(default)]
+    pub(crate) control_only: bool,
+    #[serde(default)]
+    pub(crate) todo_ids: Vec<String>,
     /// Revision is the optimistic-concurrency token for one task, not for the
     /// entire registry. It is incremented whenever deterministic facts change.
     #[serde(default)]
@@ -117,6 +166,10 @@ pub(crate) struct LifecycleSegment {
     #[serde(default)]
     pub(crate) has_pending_todo: bool,
     #[serde(default)]
+    pub(crate) is_control_segment: bool,
+    #[serde(default)]
+    pub(crate) todo_ids: Vec<String>,
+    #[serde(default)]
     pub(crate) token_estimate: usize,
     #[serde(default)]
     pub(crate) evicted: bool,
@@ -142,10 +195,15 @@ pub(crate) struct LifecycleRegistry {
     pub(crate) tasks: BTreeMap<String, LifecycleTask>,
     #[serde(default)]
     pub(crate) segments: BTreeMap<String, LifecycleSegment>,
-    /// A turn owns one provisional task in phase one. A later reducer may
-    /// propose a validated merge, but no inference silently changes ownership.
+    #[serde(default)]
+    pub(crate) todo_ledger: BTreeMap<String, LifecycleTodoItem>,
+    /// Maps a dialog turn to its retained root objective work unit. Ordinary
+    /// segments may instead belong to Todo-derived work units beneath it.
     #[serde(default)]
     pub(crate) turn_task_ids: BTreeMap<String, String>,
+    /// Current work-unit owner for ordinary tool segments in each dialog turn.
+    #[serde(default)]
+    pub(crate) active_work_unit_ids: BTreeMap<String, String>,
 }
 
 impl Default for LifecycleRegistry {
@@ -159,7 +217,9 @@ impl Default for LifecycleRegistry {
             next_snapshot_seq: 0,
             tasks: BTreeMap::new(),
             segments: BTreeMap::new(),
+            todo_ledger: BTreeMap::new(),
             turn_task_ids: BTreeMap::new(),
+            active_work_unit_ids: BTreeMap::new(),
         }
     }
 }
@@ -176,6 +236,7 @@ pub(crate) struct LifecycleEstimatorSnapshot {
     pub(crate) current_task_id: String,
     /// The complete source prompt is exposed only for the current user task.
     pub(crate) current_user_prompt: String,
+    pub(crate) todos: Vec<LifecycleTodoItem>,
     pub(crate) tasks: Vec<LifecycleTaskSnapshot>,
 }
 
@@ -183,6 +244,10 @@ pub(crate) struct LifecycleEstimatorSnapshot {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LifecycleTaskSnapshot {
     pub(crate) task_id: String,
+    pub(crate) root_task_id: String,
+    pub(crate) source: LifecycleWorkUnitSource,
+    pub(crate) control_only: bool,
+    pub(crate) todo_ids: Vec<String>,
     pub(crate) expected_revision: u64,
     pub(crate) title: Option<String>,
     /// Older tasks do not repeat the raw source prompt. This field is present
@@ -229,6 +294,19 @@ pub(crate) struct LifecycleReducerRejection {
 pub(crate) struct LifecycleReducerOutcome {
     pub(crate) applied_task_ids: Vec<String>,
     pub(crate) rejected_updates: Vec<LifecycleReducerRejection>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LifecycleWorkUnitProtection {
+    pub(crate) task_id: String,
+    pub(crate) reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LifecycleTodoWrite {
+    todos: Vec<(String, String, LifecycleTodoStatus)>,
+    replaces_root: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -387,7 +465,7 @@ where
 async fn estimate_snapshot_with_fast_model(
     snapshot: LifecycleEstimatorSnapshot,
 ) -> Result<String, String> {
-    const PROMPT: &str = r#"You are a conservative lifecycle estimator for a software-engineering agent. Return ONLY JSON with this schema: {"snapshotId": string, "taskUpdates": [{"taskId": string, "expectedRevision": number, "lifecycle": "active"|"completed"|"evictable", "completionEvidence": [string], "unresolvedItems": [string]}]}. Use only task IDs and revisions from the input. Never make a task evictable if it has an error, unfinished Todo, unresolved item, recent activity, or uncertainty. A task must first be completed with concrete evidence before it becomes evictable. Prefer no update over a risky update."#;
+    const PROMPT: &str = r#"You are a conservative lifecycle estimator for a software-engineering agent. Return ONLY JSON with this schema: {"snapshotId": string, "taskUpdates": [{"taskId": string, "expectedRevision": number, "lifecycle": "active"|"completed"|"evictable", "completionEvidence": [string], "unresolvedItems": [string]}]}. The currentUserPrompt is the immutable root objective. Each task is a work unit; tasks with source root_fallback or controlOnly true are retained control context and must never be made evictable. Todo tasks refer to current Todo ledger entries by todoIds. Never make a task evictable if a linked Todo is not completed, there is an error, unresolved item, recent activity, a dependency, or uncertainty. A task must first be completed with concrete evidence before it becomes evictable. Use only task IDs and revisions from the input. Prefer no update over a risky update."#;
     let input = serde_json::to_string(&snapshot)
         .map_err(|error| format!("lifecycle snapshot serialization: {error}"))?;
     let request = async {
@@ -429,8 +507,8 @@ pub(crate) fn parse_estimator_delta(text: &str) -> BitFunResult<LifecycleEstimat
 }
 
 impl LifecycleRegistry {
-    /// Creates one conservative provisional task for an actual user turn. The
-    /// source prompt is kept exactly as supplied; no character cap is applied.
+    /// Creates one retained root objective for an actual user turn. The source
+    /// prompt is kept exactly as supplied; no character cap is applied.
     pub(crate) fn observe_user_turn(
         &mut self,
         turn_id: &str,
@@ -444,6 +522,10 @@ impl LifecycleRegistry {
             task_id.clone(),
             LifecycleTask {
                 id: task_id.clone(),
+                root_task_id: task_id.clone(),
+                source: LifecycleWorkUnitSource::RootFallback,
+                control_only: true,
+                todo_ids: vec![],
                 revision: 1,
                 title: None,
                 original_user_prompt: original_user_prompt.to_string(),
@@ -459,6 +541,8 @@ impl LifecycleRegistry {
             },
         );
         self.turn_task_ids
+            .insert(turn_id.to_string(), task_id.clone());
+        self.active_work_unit_ids
             .insert(turn_id.to_string(), task_id.clone());
         self.registry_revision += 1;
         task_id
@@ -488,7 +572,19 @@ impl LifecycleRegistry {
             return Some(id);
         }
 
-        let owner_task_id = self.ensure_task_for_turn(turn_id);
+        let root_task_id = self.ensure_task_for_turn(turn_id);
+        let todo_writes = todo_writes_from_results(tool_calls, results);
+        // A failed TodoWrite is still plan/control context. It must stay on the
+        // root even though its requested state is not admitted to the ledger.
+        let is_control_segment = tool_calls.iter().any(|call| call.tool_name == "TodoWrite");
+        let owner_task_id = if is_control_segment {
+            root_task_id.clone()
+        } else {
+            self.active_work_unit_ids
+                .get(turn_id)
+                .cloned()
+                .unwrap_or_else(|| root_task_id.clone())
+        };
         self.latest_tick_seq += 1;
         let tool_facts = tool_calls
             .iter()
@@ -500,7 +596,16 @@ impl LifecycleRegistry {
             .collect();
         let result_facts = results.iter().filter_map(result_fact).collect::<Vec<_>>();
         let has_error = result_facts.iter().any(|fact| fact.is_error);
-        let has_pending_todo = tool_calls.iter().any(todo_call_has_pending_items);
+        let has_pending_todo =
+            todo_writes
+                .iter()
+                .flat_map(|write| &write.todos)
+                .any(|(_, _, status)| {
+                    matches!(
+                        status,
+                        LifecycleTodoStatus::Pending | LifecycleTodoStatus::InProgress
+                    )
+                });
         let token_estimate = result_facts
             .iter()
             .map(|fact| fact.char_count)
@@ -523,19 +628,147 @@ impl LifecycleRegistry {
                 result_facts,
                 has_error,
                 has_pending_todo,
+                is_control_segment,
+                todo_ids: todo_writes
+                    .iter()
+                    .flat_map(|write| &write.todos)
+                    .map(|(todo_id, _, _)| todo_id.clone())
+                    .collect(),
                 token_estimate,
                 evicted: false,
             },
         );
-        let task = self
-            .tasks
-            .get_mut(&owner_task_id)
-            .expect("owner task exists");
-        task.segment_ids.push(id.clone());
-        task.last_activity_tick = self.latest_tick_seq;
-        task.revision += 1;
+        {
+            let task = self
+                .tasks
+                .get_mut(&owner_task_id)
+                .expect("owner task exists");
+            if !is_control_segment && task.lifecycle != LifecycleTaskState::Active {
+                task.lifecycle = LifecycleTaskState::Active;
+                task.completion_evidence.clear();
+                task.unresolved_items.clear();
+            }
+            task.segment_ids.push(id.clone());
+            task.last_activity_tick = self.latest_tick_seq;
+            task.revision += 1;
+        }
+        for todo_write in todo_writes {
+            self.apply_todo_updates(&root_task_id, todo_write.todos, todo_write.replaces_root);
+        }
         self.registry_revision += 1;
         Some(id)
+    }
+
+    fn apply_todo_updates(
+        &mut self,
+        root_task_id: &str,
+        updates: Vec<(String, String, LifecycleTodoStatus)>,
+        replaces_root: bool,
+    ) {
+        if replaces_root {
+            let updated_keys: BTreeSet<String> = updates
+                .iter()
+                .map(|(todo_id, _, _)| format!("{root_task_id}:{todo_id}"))
+                .collect();
+            // A Todo-derived work unit retains a link to its originating item.
+            // Do not delete that audit fact when a later whole-list update omits
+            // it. An omitted unfinished item is conservatively cancelled; an
+            // already completed item stays completed and remains eligible for
+            // lifecycle assessment.
+            for item in self.todo_ledger.values_mut().filter(|item| {
+                item.root_task_id == root_task_id
+                    && !updated_keys.contains(&item.key)
+                    && item.status != LifecycleTodoStatus::Completed
+            }) {
+                item.status = LifecycleTodoStatus::Cancelled;
+                item.last_update_tick = self.latest_tick_seq;
+            }
+        }
+        for (todo_id, content, status) in updates {
+            let key = format!("{root_task_id}:{todo_id}");
+            self.todo_ledger.insert(
+                key.clone(),
+                LifecycleTodoItem {
+                    key,
+                    todo_id,
+                    root_task_id: root_task_id.to_string(),
+                    content,
+                    status,
+                    last_update_tick: self.latest_tick_seq,
+                },
+            );
+        }
+        self.refresh_active_work_unit(root_task_id);
+    }
+
+    fn refresh_active_work_unit(&mut self, root_task_id: &str) {
+        let Some(turn_id) = self
+            .tasks
+            .get(root_task_id)
+            .and_then(|task| task.covered_turn_ids.first())
+            .cloned()
+        else {
+            return;
+        };
+        let in_progress: Vec<LifecycleTodoItem> = self
+            .todo_ledger
+            .values()
+            .filter(|item| {
+                item.root_task_id == root_task_id && item.status == LifecycleTodoStatus::InProgress
+            })
+            .cloned()
+            .collect();
+        let active_id = if in_progress.len() == 1 {
+            Some(self.ensure_todo_work_unit(root_task_id, &in_progress[0]))
+        } else {
+            None
+        };
+        self.active_work_unit_ids.insert(
+            turn_id,
+            active_id.unwrap_or_else(|| root_task_id.to_string()),
+        );
+    }
+
+    fn ensure_todo_work_unit(&mut self, root_task_id: &str, item: &LifecycleTodoItem) -> String {
+        let task_id = format!("{root_task_id}:todo:{}", item.todo_id);
+        let root_turn_id = self
+            .tasks
+            .get(root_task_id)
+            .and_then(|task| task.covered_turn_ids.first())
+            .cloned()
+            .unwrap_or_default();
+        let task = self
+            .tasks
+            .entry(task_id.clone())
+            .or_insert_with(|| LifecycleTask {
+                id: task_id.clone(),
+                root_task_id: root_task_id.to_string(),
+                source: LifecycleWorkUnitSource::Todo,
+                control_only: false,
+                todo_ids: vec![item.key.clone()],
+                revision: 1,
+                title: Some(item.content.clone()),
+                original_user_prompt: String::new(),
+                objective: item.content.clone(),
+                acceptance_criteria: vec![],
+                lifecycle: LifecycleTaskState::Active,
+                covered_turn_ids: vec![root_turn_id],
+                segment_ids: vec![],
+                completion_evidence: vec![],
+                unresolved_items: vec![],
+                dependencies: vec![],
+                last_activity_tick: self.latest_tick_seq,
+            });
+        if task.title.as_deref() != Some(item.content.as_str()) {
+            task.title = Some(item.content.clone());
+            task.objective = item.content.clone();
+            task.revision += 1;
+        }
+        if !task.todo_ids.contains(&item.key) {
+            task.todo_ids.push(item.key.clone());
+            task.revision += 1;
+        }
+        task_id
     }
 
     /// Creates an immutable input every three newly recorded ticks. Scheduling
@@ -582,7 +815,7 @@ impl LifecycleRegistry {
         &mut self,
         current_turn_id: &str,
     ) -> BitFunResult<Option<LifecycleEstimatorSnapshot>> {
-        let current_task_id = self
+        let current_root_task_id = self
             .turn_task_ids
             .get(current_turn_id)
             .cloned()
@@ -593,14 +826,19 @@ impl LifecycleRegistry {
             })?;
         let current_user_prompt = self
             .tasks
-            .get(&current_task_id)
+            .get(&current_root_task_id)
             .ok_or_else(|| {
                 BitFunError::tool(format!(
-                    "lifecycle snapshot current task disappeared: {current_task_id}"
+                    "lifecycle snapshot current root task disappeared: {current_root_task_id}"
                 ))
             })?
             .original_user_prompt
             .clone();
+        let current_task_id = self
+            .active_work_unit_ids
+            .get(current_turn_id)
+            .cloned()
+            .unwrap_or_else(|| current_root_task_id.clone());
 
         self.next_snapshot_seq += 1;
         self.last_snapshot_tick_seq = self.latest_tick_seq;
@@ -614,11 +852,16 @@ impl LifecycleRegistry {
             .values()
             .map(|task| LifecycleTaskSnapshot {
                 task_id: task.id.clone(),
+                root_task_id: task.root_task_id.clone(),
+                source: task.source,
+                control_only: task.control_only,
+                todo_ids: task.todo_ids.clone(),
                 expected_revision: task.revision,
                 title: task.title.clone(),
                 normalized_objective: (task.id != current_task_id
-                    && task.objective != task.original_user_prompt)
-                    .then(|| task.objective.clone()),
+                    && task.id != task.root_task_id
+                    && !task.objective.is_empty())
+                .then(|| task.objective.clone()),
                 lifecycle: task.lifecycle,
                 acceptance_criteria: task.acceptance_criteria.clone(),
                 completion_evidence: task.completion_evidence.clone(),
@@ -639,6 +882,7 @@ impl LifecycleRegistry {
             current_turn_id: current_turn_id.to_string(),
             current_task_id,
             current_user_prompt,
+            todos: self.todo_ledger.values().cloned().collect(),
             tasks,
         }))
     }
@@ -774,32 +1018,68 @@ impl LifecycleRegistry {
     }
 
     fn task_is_deterministically_protected(&self, task_id: &str) -> bool {
+        !self.task_protection_reasons(task_id).is_empty()
+    }
+
+    pub(crate) fn work_unit_protection_reasons(&self) -> Vec<LifecycleWorkUnitProtection> {
+        self.tasks
+            .keys()
+            .map(|task_id| LifecycleWorkUnitProtection {
+                task_id: task_id.clone(),
+                reasons: self.task_protection_reasons(task_id),
+            })
+            .collect()
+    }
+
+    fn task_protection_reasons(&self, task_id: &str) -> Vec<String> {
         let Some(task) = self.tasks.get(task_id) else {
-            return true;
+            return vec!["missing_work_unit".to_string()];
         };
+        let mut reasons = Vec::new();
+        if task.control_only {
+            reasons.push("control_work_unit".to_string());
+        }
         if self.latest_tick_seq.saturating_sub(task.last_activity_tick) < RECENT_SEGMENTS_TO_PROTECT
         {
-            return true;
+            reasons.push("recent_activity".to_string());
+        }
+        if task.todo_ids.iter().any(|todo_key| {
+            self.todo_ledger
+                .get(todo_key)
+                .is_none_or(|item| item.status != LifecycleTodoStatus::Completed)
+        }) {
+            reasons.push("todo_not_completed".to_string());
         }
         if task
             .segment_ids
             .iter()
             .filter_map(|id| self.segments.get(id))
-            .any(|segment| segment.has_error || segment.has_pending_todo || segment.evicted)
+            .any(|segment| segment.has_error)
         {
-            return true;
+            reasons.push("tool_error".to_string());
         }
-        self.tasks.values().any(|other| {
+        if task
+            .segment_ids
+            .iter()
+            .filter_map(|id| self.segments.get(id))
+            .any(|segment| segment.evicted || segment.is_control_segment)
+        {
+            reasons.push("invalid_work_unit_segment".to_string());
+        }
+        if self.tasks.values().any(|other| {
             other.id != task_id
                 && other.lifecycle == LifecycleTaskState::Active
                 && other
                     .dependencies
                     .iter()
                     .any(|dependency| dependency == task_id)
-        })
+        }) {
+            reasons.push("active_dependency".to_string());
+        }
+        reasons
     }
 
-    /// Converts v1 segment-only state into a safe v2 registry. Legacy records
+    /// Converts v1/v2 state into a safe v3 registry. Legacy records
     /// are active and cannot be evicted until a new estimator run supplies task
     /// evidence. No historical user prompt is invented during migration.
     pub(crate) fn normalize_after_load(&mut self) {
@@ -808,8 +1088,22 @@ impl LifecycleRegistry {
                 .segments
                 .values()
                 .all(|segment| !segment.owner_task_id.is_empty())
+            && self
+                .tasks
+                .values()
+                .all(|task| !task.root_task_id.is_empty())
         {
             return;
+        }
+        for task in self.tasks.values_mut() {
+            if task.root_task_id.is_empty() {
+                task.root_task_id = task.id.clone();
+            }
+            // Existing v2 tasks were dialog-turn tasks, not validated Todo
+            // work units. Keep them conservative and non-evictable.
+            task.source = LifecycleWorkUnitSource::RootFallback;
+            task.control_only = true;
+            task.todo_ids.clear();
         }
         let segment_ids: Vec<String> = self.segments.keys().cloned().collect();
         for segment_id in segment_ids {
@@ -828,6 +1122,10 @@ impl LifecycleRegistry {
                         legacy_id.clone(),
                         LifecycleTask {
                             id: legacy_id.clone(),
+                            root_task_id: legacy_id.clone(),
+                            source: LifecycleWorkUnitSource::RootFallback,
+                            control_only: true,
+                            todo_ids: vec![],
                             revision: 1,
                             title: Some("Legacy lifecycle record".to_string()),
                             original_user_prompt: String::new(),
@@ -858,6 +1156,10 @@ impl LifecycleRegistry {
                 .entry(owner_task_id.clone())
                 .or_insert_with(|| LifecycleTask {
                     id: owner_task_id.clone(),
+                    root_task_id: owner_task_id.clone(),
+                    source: LifecycleWorkUnitSource::RootFallback,
+                    control_only: true,
+                    todo_ids: vec![],
                     revision: 1,
                     title: Some("Recovered lifecycle task".to_string()),
                     original_user_prompt: String::new(),
@@ -877,6 +1179,11 @@ impl LifecycleRegistry {
                 task.segment_ids.push(segment_id);
             }
             task.last_activity_tick = task.last_activity_tick.max(tick_seq);
+        }
+        for (turn_id, root_task_id) in &self.turn_task_ids {
+            self.active_work_unit_ids
+                .entry(turn_id.clone())
+                .or_insert_with(|| root_task_id.clone());
         }
         self.schema_version = REGISTRY_SCHEMA_VERSION;
         self.registry_revision += 1;
@@ -903,6 +1210,24 @@ impl LifecycleRegistry {
         }
         let mut referenced = BTreeSet::new();
         for (task_id, task) in &self.tasks {
+            if task.root_task_id.is_empty() || !self.tasks.contains_key(&task.root_task_id) {
+                return Err(BitFunError::tool(format!(
+                    "lifecycle work unit {task_id} references missing root {}",
+                    task.root_task_id
+                )));
+            }
+            for todo_key in &task.todo_ids {
+                let todo = self.todo_ledger.get(todo_key).ok_or_else(|| {
+                    BitFunError::tool(format!(
+                        "lifecycle work unit {task_id} references missing Todo {todo_key}"
+                    ))
+                })?;
+                if todo.root_task_id != task.root_task_id {
+                    return Err(BitFunError::tool(format!(
+                        "lifecycle Todo {todo_key} belongs to a different root"
+                    )));
+                }
+            }
             for segment_id in &task.segment_ids {
                 if !referenced.insert(segment_id) {
                     return Err(BitFunError::tool(format!(
@@ -980,20 +1305,62 @@ fn result_fact(message: &Message) -> Option<LifecycleResultFact> {
     })
 }
 
-fn todo_call_has_pending_items(call: &ToolCall) -> bool {
-    call.tool_name == "TodoWrite"
-        && call
-            .arguments
-            .get("todos")
-            .and_then(|value| value.as_array())
-            .is_some_and(|todos| {
-                todos.iter().any(|todo| {
-                    matches!(
-                        todo.get("status").and_then(|value| value.as_str()),
-                        Some("pending" | "in_progress")
-                    )
+fn todo_writes_from_results(calls: &[ToolCall], results: &[Message]) -> Vec<LifecycleTodoWrite> {
+    calls
+        .iter()
+        .filter_map(|call| {
+            if call.tool_name != "TodoWrite" {
+                return None;
+            }
+            let result = results.iter().find_map(|message| match &message.content {
+                MessageContent::ToolResult {
+                    tool_id,
+                    result,
+                    is_error: false,
+                    ..
+                } if tool_id == &call.tool_id => Some(result),
+                _ => None,
+            })?;
+            let todos = result
+                .get("todos")
+                .or_else(|| call.arguments.get("todos"))
+                .and_then(|value| value.as_array())?;
+            let todos = todos
+                .iter()
+                .enumerate()
+                .filter_map(|(index, todo)| {
+                    let todo_id = todo
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| format!("anonymous-{index}"));
+                    let content = todo
+                        .get("content")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let status = match todo.get("status")?.as_str()? {
+                        "pending" => LifecycleTodoStatus::Pending,
+                        "in_progress" => LifecycleTodoStatus::InProgress,
+                        "completed" => LifecycleTodoStatus::Completed,
+                        "cancelled" => LifecycleTodoStatus::Cancelled,
+                        _ => return None,
+                    };
+                    Some((todo_id, content, status))
                 })
+                .collect();
+            Some(LifecycleTodoWrite {
+                todos,
+                // TodoWrite itself returns `merge: false`; defaulting to a
+                // replacement keeps its documented whole-list semantics when
+                // adapters omit that field.
+                replaces_root: !result
+                    .get("merge")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
             })
+        })
+        .collect()
 }
 
 fn extract_json_object(text: &str) -> Option<&str> {
@@ -1088,11 +1455,11 @@ mod tests {
             calls.push(ToolCall {
                 tool_id: format!("{suffix}-todo"),
                 tool_name: "TodoWrite".into(),
-                arguments: serde_json::json!({"todos":[{"status":"pending"}]}),
+                arguments: serde_json::json!({"todos":[{"id":format!("{suffix}-todo"),"content":"finish the work unit","status":"pending"}]}),
                 ..Default::default()
             });
         }
-        vec![
+        let mut messages = vec![
             Message::assistant_with_tools("inspect".into(), calls).with_turn_id(turn.into()),
             Message::tool_result(ToolResult {
                 tool_id: format!("{suffix}-read"),
@@ -1100,6 +1467,52 @@ mod tests {
                 result: serde_json::json!({}),
                 result_for_assistant: Some("full result".into()),
                 is_error: error,
+                duration_ms: None,
+                image_attachments: None,
+            })
+            .with_turn_id(turn.into()),
+        ];
+        if pending {
+            messages.push(
+                Message::tool_result(ToolResult {
+                    tool_id: format!("{suffix}-todo"),
+                    tool_name: "TodoWrite".into(),
+                    result: serde_json::json!({"success": true}),
+                    result_for_assistant: Some("todo updated".into()),
+                    is_error: false,
+                    duration_ms: None,
+                    image_attachments: None,
+                })
+                .with_turn_id(turn.into()),
+            );
+        }
+        messages
+    }
+
+    fn todo_round(turn: &str, suffix: &str, todo_id: &str, status: &str) -> Vec<Message> {
+        vec![
+            Message::assistant_with_tools(
+                "update plan".into(),
+                vec![ToolCall {
+                    tool_id: format!("{suffix}-todo-call"),
+                    tool_name: "TodoWrite".into(),
+                    arguments: serde_json::json!({
+                        "todos": [{
+                            "id": todo_id,
+                            "content": "finish the work unit",
+                            "status": status
+                        }]
+                    }),
+                    ..Default::default()
+                }],
+            )
+            .with_turn_id(turn.into()),
+            Message::tool_result(ToolResult {
+                tool_id: format!("{suffix}-todo-call"),
+                tool_name: "TodoWrite".into(),
+                result: serde_json::json!({"success": true}),
+                result_for_assistant: Some("todo updated".into()),
+                is_error: false,
                 duration_ms: None,
                 image_attachments: None,
             })
@@ -1131,6 +1544,288 @@ mod tests {
         assert_eq!(segment.tool_facts[0].tool_name, "Read");
         assert_eq!(segment.result_facts[0].preview, "full result");
         assert_eq!(registry.latest_tick_seq, 1);
+        registry.validate().unwrap();
+    }
+
+    #[test]
+    fn no_todo_fallback_is_a_control_work_unit_and_never_a_candidate() {
+        let mut registry = LifecycleRegistry::default();
+        let messages = round("turn-1", "one", false, false);
+        let segment_id = registry.record_segment(&messages, 0, 2, "turn-1").unwrap();
+        let task_id = registry.segments[&segment_id].owner_task_id.clone();
+        assert_eq!(
+            registry.tasks[&task_id].source,
+            LifecycleWorkUnitSource::RootFallback
+        );
+        assert!(registry.tasks[&task_id].control_only);
+        registry.tasks.get_mut(&task_id).unwrap().lifecycle = LifecycleTaskState::Evictable;
+        registry
+            .tasks
+            .get_mut(&task_id)
+            .unwrap()
+            .completion_evidence = vec!["done".into()];
+        registry.latest_tick_seq = 3;
+        assert!(registry.shadow_candidate_segment_ids().is_empty());
+    }
+
+    #[test]
+    fn todo_ledger_assigns_ordinary_segments_and_releases_completed_work_unit() {
+        let mut registry = LifecycleRegistry::default();
+        let root_id = registry.observe_user_turn("turn-1", "fix the parser");
+        let started = todo_round("turn-1", "start", "one-todo", "in_progress");
+        let control_segment = registry.record_segment(&started, 0, 2, "turn-1").unwrap();
+        assert_eq!(registry.segments[&control_segment].owner_task_id, root_id);
+        assert!(registry.segments[&control_segment].is_control_segment);
+
+        let active_task_id = registry.active_work_unit_ids["turn-1"].clone();
+        assert_eq!(
+            registry.tasks[&active_task_id].source,
+            LifecycleWorkUnitSource::Todo
+        );
+        assert!(registry
+            .work_unit_protection_reasons()
+            .iter()
+            .find(|entry| entry.task_id == active_task_id)
+            .unwrap()
+            .reasons
+            .contains(&"todo_not_completed".to_string()));
+        let work = round("turn-1", "two", false, false);
+        let work_segment = registry.record_segment(&work, 0, 2, "turn-1").unwrap();
+        assert_eq!(
+            registry.segments[&work_segment].owner_task_id,
+            active_task_id
+        );
+        assert!(!registry.segments[&work_segment].is_control_segment);
+
+        let finished = todo_round("turn-1", "finish", "one-todo", "completed");
+        let finish_segment = registry.record_segment(&finished, 0, 2, "turn-1").unwrap();
+        assert_eq!(
+            registry.segments[&finish_segment].owner_task_id,
+            "task:turn-1"
+        );
+        assert_eq!(
+            registry.todo_ledger["task:turn-1:one-todo"].status,
+            LifecycleTodoStatus::Completed
+        );
+        assert_eq!(registry.active_work_unit_ids["turn-1"], "task:turn-1");
+        assert!(!registry
+            .work_unit_protection_reasons()
+            .iter()
+            .find(|entry| entry.task_id == active_task_id)
+            .unwrap()
+            .reasons
+            .contains(&"todo_not_completed".to_string()));
+        registry.validate().unwrap();
+    }
+
+    #[test]
+    fn latest_successful_todo_write_cancels_omitted_unfinished_items() {
+        let mut registry = LifecycleRegistry::default();
+        registry.observe_user_turn("turn-1", "fix the parser");
+        let first = todo_round("turn-1", "first", "todo-1", "in_progress");
+        registry.record_segment(&first, 0, 2, "turn-1").unwrap();
+
+        let second = todo_round("turn-1", "second", "todo-2", "in_progress");
+        registry.record_segment(&second, 0, 2, "turn-1").unwrap();
+
+        assert_eq!(registry.todo_ledger.len(), 2);
+        assert!(registry.todo_ledger.contains_key("task:turn-1:todo-2"));
+        assert_eq!(
+            registry.todo_ledger["task:turn-1:todo-1"].status,
+            LifecycleTodoStatus::Cancelled
+        );
+        assert_eq!(
+            registry.active_work_unit_ids["turn-1"],
+            "task:turn-1:todo:todo-2"
+        );
+        registry.validate().unwrap();
+    }
+
+    #[test]
+    fn todo_ledger_uses_generated_id_from_successful_result() {
+        let mut registry = LifecycleRegistry::default();
+        registry.observe_user_turn("turn-1", "fix the parser");
+        let mut messages = todo_round("turn-1", "generated", "request-id", "in_progress");
+        if let MessageContent::Mixed { tool_calls, .. } = &mut messages[0].content {
+            tool_calls[0]
+                .arguments
+                .get_mut("todos")
+                .and_then(|todos| todos.as_array_mut())
+                .unwrap()[0]
+                .as_object_mut()
+                .unwrap()
+                .remove("id");
+        }
+        if let MessageContent::ToolResult { result, .. } = &mut messages[1].content {
+            *result = serde_json::json!({
+                "success": true,
+                "merge": false,
+                "todos": [{
+                    "id": "generated-id",
+                    "content": "finish the work unit",
+                    "status": "in_progress"
+                }]
+            });
+        }
+        registry.record_segment(&messages, 0, 2, "turn-1").unwrap();
+
+        assert!(registry
+            .todo_ledger
+            .contains_key("task:turn-1:generated-id"));
+        assert!(!registry.todo_ledger.contains_key("task:turn-1:anonymous-0"));
+        registry.validate().unwrap();
+    }
+
+    #[test]
+    fn snapshot_exposes_current_todo_work_unit_without_repeating_root_objective() {
+        let mut registry = LifecycleRegistry::default();
+        let root_prompt = format!("repair the parser {}", "x".repeat(1_500));
+        registry.observe_user_turn("turn-1", &root_prompt);
+        let started = todo_round("turn-1", "start", "todo-1", "in_progress");
+        registry.record_segment(&started, 0, 2, "turn-1").unwrap();
+        for suffix in ["inspect", "patch"] {
+            let messages = round("turn-1", suffix, false, false);
+            registry.record_segment(&messages, 0, 2, "turn-1").unwrap();
+        }
+
+        let snapshot = registry.schedule_snapshot("turn-1").unwrap().unwrap();
+        let work_unit = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "task:turn-1:todo:todo-1")
+            .unwrap();
+        assert_eq!(snapshot.current_user_prompt, root_prompt);
+        assert_eq!(snapshot.current_task_id, work_unit.task_id);
+        assert_eq!(work_unit.source, LifecycleWorkUnitSource::Todo);
+        assert!(!work_unit.control_only);
+        assert_eq!(work_unit.todo_ids, vec!["task:turn-1:todo-1"]);
+        assert_eq!(work_unit.segments.len(), 2);
+        assert_eq!(snapshot.todos.len(), 1);
+        assert_eq!(snapshot.todos[0].status, LifecycleTodoStatus::InProgress);
+        assert!(snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "task:turn-1")
+            .unwrap()
+            .normalized_objective
+            .is_none());
+        assert_eq!(
+            serde_json::to_string(&snapshot)
+                .unwrap()
+                .matches(&root_prompt)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn completed_todo_work_unit_becomes_candidate_during_later_work_in_same_turn() {
+        let mut registry = LifecycleRegistry::default();
+        registry.observe_user_turn("turn-1", "fix the parser");
+        let start_one = todo_round("turn-1", "start-one", "todo-1", "in_progress");
+        registry.record_segment(&start_one, 0, 2, "turn-1");
+        let work_one = round("turn-1", "work-one", false, false);
+        let work_one_segment = registry.record_segment(&work_one, 0, 2, "turn-1").unwrap();
+        let finish_one = todo_round("turn-1", "finish-one", "todo-1", "completed");
+        registry.record_segment(&finish_one, 0, 2, "turn-1");
+        let start_two = todo_round("turn-1", "start-two", "todo-2", "in_progress");
+        registry.record_segment(&start_two, 0, 2, "turn-1");
+        for suffix in ["work-two-a", "work-two-b"] {
+            let messages = round("turn-1", suffix, false, false);
+            registry.record_segment(&messages, 0, 2, "turn-1");
+        }
+        let first_snapshot = registry.schedule_snapshot("turn-1").unwrap().unwrap();
+        let first_task_id = "task:turn-1:todo:todo-1";
+        let first_revision = first_snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == first_task_id)
+            .unwrap()
+            .expected_revision;
+        let completed = registry
+            .reduce_estimator_delta(
+                &first_snapshot,
+                LifecycleEstimatorDelta {
+                    snapshot_id: first_snapshot.snapshot_id.clone(),
+                    task_updates: vec![update(
+                        first_task_id,
+                        first_revision,
+                        LifecycleTaskState::Completed,
+                        &["Todo 1 is marked completed and its inspection finished"],
+                    )],
+                },
+            )
+            .unwrap();
+        assert_eq!(completed.applied_task_ids, vec![first_task_id]);
+
+        for suffix in ["work-two-c", "work-two-d", "work-two-e"] {
+            let messages = round("turn-1", suffix, false, false);
+            registry.record_segment(&messages, 0, 2, "turn-1");
+        }
+        let second_snapshot = registry.schedule_snapshot("turn-1").unwrap().unwrap();
+        let first_revision = second_snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == first_task_id)
+            .unwrap()
+            .expected_revision;
+        let evictable = registry
+            .reduce_estimator_delta(
+                &second_snapshot,
+                LifecycleEstimatorDelta {
+                    snapshot_id: second_snapshot.snapshot_id.clone(),
+                    task_updates: vec![update(
+                        first_task_id,
+                        first_revision,
+                        LifecycleTaskState::Evictable,
+                        &["Todo 1 is marked completed and its inspection finished"],
+                    )],
+                },
+            )
+            .unwrap();
+        assert_eq!(evictable.applied_task_ids, vec![first_task_id]);
+        assert_eq!(
+            registry.shadow_candidate_segment_ids(),
+            vec![work_one_segment]
+        );
+    }
+
+    #[test]
+    fn failed_todo_write_does_not_change_the_work_unit_ledger() {
+        let mut registry = LifecycleRegistry::default();
+        registry.observe_user_turn("turn-1", "fix the parser");
+        let mut failed = todo_round("turn-1", "failed", "todo-1", "in_progress");
+        if let MessageContent::ToolResult { is_error, .. } = &mut failed[1].content {
+            *is_error = true;
+        }
+        registry.record_segment(&failed, 0, 2, "turn-1").unwrap();
+        assert!(registry.todo_ledger.is_empty());
+        assert_eq!(registry.active_work_unit_ids["turn-1"], "task:turn-1");
+        assert_eq!(registry.tasks.len(), 1);
+        registry.validate().unwrap();
+    }
+
+    #[test]
+    fn failed_todo_write_stays_pinned_to_root_during_active_work() {
+        let mut registry = LifecycleRegistry::default();
+        registry.observe_user_turn("turn-1", "fix the parser");
+        let started = todo_round("turn-1", "start", "todo-1", "in_progress");
+        registry.record_segment(&started, 0, 2, "turn-1");
+        let active_task_id = registry.active_work_unit_ids["turn-1"].clone();
+        let mut failed = todo_round("turn-1", "failed", "todo-1", "completed");
+        if let MessageContent::ToolResult { is_error, .. } = &mut failed[1].content {
+            *is_error = true;
+        }
+        let failed_segment = registry.record_segment(&failed, 0, 2, "turn-1").unwrap();
+        assert_eq!(
+            registry.segments[&failed_segment].owner_task_id,
+            "task:turn-1"
+        );
+        assert_eq!(registry.active_work_unit_ids["turn-1"], active_task_id);
+        assert_eq!(
+            registry.todo_ledger["task:turn-1:todo-1"].status,
+            LifecycleTodoStatus::InProgress
+        );
         registry.validate().unwrap();
     }
 
@@ -1181,7 +1876,9 @@ mod tests {
     fn captures_error_and_pending_todo_as_deterministic_facts() {
         let mut registry = LifecycleRegistry::default();
         let messages = round("turn-1", "one", true, true);
-        let id = registry.record_segment(&messages, 0, 2, "turn-1").unwrap();
+        let id = registry
+            .record_segment(&messages, 0, messages.len(), "turn-1")
+            .unwrap();
         let segment = &registry.segments[&id];
         assert!(segment.has_error);
         assert!(segment.has_pending_todo);
@@ -1257,6 +1954,12 @@ mod tests {
         registry.observe_user_turn("turn-2", &current_prompt);
         let messages = round("turn-2", "three", false, false);
         registry.record_segment(&messages, 0, 2, "turn-2");
+        // This fixture models explicit non-control work units so reducer and
+        // candidate tests can exercise the legal transition independently of
+        // the production no-Todo fallback rule.
+        for task in registry.tasks.values_mut() {
+            task.control_only = false;
+        }
         let snapshot = registry.schedule_snapshot("turn-2").unwrap().unwrap();
         (registry, snapshot, old_prompt, current_prompt)
     }
@@ -1484,8 +2187,13 @@ mod tests {
                 current_turn_id: "turn-2".to_string(),
                 current_task_id: "task:turn-2".to_string(),
                 current_user_prompt: "other task".to_string(),
+                todos: vec![],
                 tasks: vec![LifecycleTaskSnapshot {
                     task_id: "task:turn-1".to_string(),
+                    root_task_id: "task:turn-1".to_string(),
+                    source: LifecycleWorkUnitSource::Todo,
+                    control_only: false,
+                    todo_ids: vec![],
                     expected_revision: task_one_revision,
                     title: None,
                     normalized_objective: None,

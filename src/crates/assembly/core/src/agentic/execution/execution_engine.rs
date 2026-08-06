@@ -4022,6 +4022,7 @@ impl ExecutionEngine {
                             }
                             Ok(outcome) => {
                                 let candidate_segment_ids = registry.shadow_candidate_segment_ids();
+                                let work_unit_protection = registry.work_unit_protection_reasons();
                                 trace["outcome"] =
                                     serde_json::json!(if outcome.applied_task_ids.is_empty() {
                                         "delta_no_task_update"
@@ -4031,6 +4032,8 @@ impl ExecutionEngine {
                                 trace["reducerOutcome"] = serde_json::json!(outcome);
                                 trace["candidateSegmentIds"] =
                                     serde_json::json!(candidate_segment_ids);
+                                trace["workUnitProtection"] =
+                                    serde_json::json!(work_unit_protection);
                                 self.persist_lifecycle_registry(&context.session_id, registry)
                                     .await;
                             }

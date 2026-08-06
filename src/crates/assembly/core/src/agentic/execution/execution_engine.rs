@@ -3008,9 +3008,10 @@ impl ExecutionEngine {
                         // Observations recorded by the deduplicator may no
                         // longer be present in the post-compression slice;
                         // reset so future observations are treated as
-                        // first-occurrences, and annotate markers that
-                        // survived compression.
-                        observation_deduplicator.reset_after_compression(&mut messages);
+                        // first-occurrences. Markers that survived compression
+                        // are self-describing (round + descriptor), so they
+                        // stay interpretable without rewriting history.
+                        observation_deduplicator.reset_after_compression();
                     }
                     Ok(None) => {
                         debug!("No eligible multi-turn context available for compression");
@@ -3219,6 +3220,11 @@ impl ExecutionEngine {
 
             // Add tool result messages to history, deduplicating observations
             // whose content is identical to a result already stored this turn.
+            // Pre-scan successful Edit/Write results first so that Read
+            // results later in the same round (e.g. from parallel tool calls)
+            // are compared against the post-edit state.
+            observation_deduplicator
+                .pre_scan_round_mutations(&round_result.tool_result_messages, round_index);
             for tool_result_msg in round_result.tool_result_messages.iter() {
                 let msg_to_store = observation_deduplicator.apply(tool_result_msg, round_index);
                 messages.push(msg_to_store.clone());
@@ -3741,6 +3747,19 @@ impl ExecutionEngine {
         info!(
             "Dialog turn loop completed: turn={}, rounds={}, total_tools={}, reason={}",
             context.dialog_turn_id, completed_rounds, total_tools, effective_finish_reason
+        );
+
+        let dedup_stats = observation_deduplicator.take_stats();
+        info!(
+            "Turn observation dedup stats: turn={}, replacements={}, persisted_hits={}, \
+             skipped_after_edit={}, resets={}, recovery_reads={}, chars_saved={}",
+            context.dialog_turn_id,
+            dedup_stats.replacements,
+            dedup_stats.persisted_hits,
+            dedup_stats.skipped_after_edit,
+            dedup_stats.resets,
+            dedup_stats.recovery_reads,
+            dedup_stats.chars_saved
         );
 
         let finish_reason = FinishReason::Complete;

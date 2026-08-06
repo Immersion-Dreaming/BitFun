@@ -14,8 +14,9 @@
 //! * Dedup keys are content addresses, never message positions. Oversized
 //!   results are persisted by `tool_result_storage` with an explicit
 //!   `Content sha256: <hash>` header line covering the full content plus
-//!   metadata; that hash is the authoritative key. Legacy persisted blobs
-//!   without the hash line are canonicalised to their preview section.
+//!   metadata; that hash is the authoritative key. Persisted blobs **without**
+//!   the hash line are deliberately not deduplicated: preview-based hashing
+//!   can collide when the truncated portion differs.
 //! * Replacement markers are self-describing: they cite the round and a short
 //!   descriptor of the original observation instead of a context position,
 //!   because message positions shift when system reminders are injected
@@ -27,7 +28,7 @@ use crate::agentic::core::{Message, MessageContent};
 use bitfun_agent_tools::PERSISTED_OUTPUT_TAG;
 use log::debug;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Minimum visible content length (chars) before we bother deduplicating.
 /// Small results don't meaningfully bloat context; skip them to avoid overhead.
@@ -52,14 +53,35 @@ const DEDUP_MARKER_PREFIX: &str = "[Observation deduped:";
 const CONTENT_SHA256_LINE_PREFIX: &str = "Content sha256: ";
 
 /// Start of the preview section header inside a persisted-output message.
+/// Also the boundary of the message header: nothing after it may be parsed
+/// as a header field.
 const PREVIEW_HEADER_PREFIX: &str = "Preview (first ";
+
+/// Key namespace for persisted outputs with an explicit content hash.
+const PERSISTED_KEY_PREFIX: &str = "persisted:";
 
 /// Short excerpt used to make dedup markers self-describing.
 const MAX_DESCRIPTOR_CHARS: usize = 120;
 
-/// Appended to markers that survived a context compression, whose original
-/// observation may no longer be present in history.
-const COMPACTION_ANNOTATION: &str = "\n[Note: context was compacted since this observation; the original content may no longer be in history. Re-read if needed.]";
+/// Structured counters for observability. The execution engine drains them at
+/// the end of each turn and reports them (see `take_stats`), so dedup impact
+/// can be measured without scraping debug logs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DedupStats {
+    /// Number of tool results replaced by a marker.
+    pub replacements: usize,
+    /// Replacements whose key came from the persisted full-content hash.
+    pub persisted_hits: usize,
+    /// Reads kept fresh because the file was edited after the original read.
+    pub skipped_after_edit: usize,
+    /// Context-compression resets performed.
+    pub resets: usize,
+    /// Reads of a path whose observation was deduplicated earlier this turn
+    /// (explicit re-reads; signals whether dedup disturbs the agent's path).
+    pub recovery_reads: usize,
+    /// Characters saved (original content minus marker) across replacements.
+    pub chars_saved: usize,
+}
 
 #[derive(Debug)]
 struct SeenObservation {
@@ -82,11 +104,74 @@ pub(crate) struct TurnObservationDeduplicator {
     /// successful mutation. Kept across compression resets: edit rounds stay
     /// valid chronological anchors and keep the freshness guard working.
     edited_files: HashMap<String, usize>,
+    /// Paths whose Read observation was replaced by a marker this turn; used
+    /// to count explicit re-reads (`dedup_recovery_reads`).
+    deduped_read_paths: HashSet<String>,
+    stats: DedupStats,
 }
 
 impl TurnObservationDeduplicator {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Drain the counters accumulated so far.
+    pub(crate) fn take_stats(&mut self) -> DedupStats {
+        std::mem::take(&mut self.stats)
+    }
+
+    /// Pre-scan a round's tool results for successful file mutations so that
+    /// dedup decisions later in the same round see the post-edit state even
+    /// when Edit/Write and Read results are processed in an arbitrary order
+    /// (e.g. parallel tool calls).
+    pub(crate) fn pre_scan_round_mutations(&mut self, messages: &[Message], round_index: usize) {
+        for message in messages {
+            self.record_mutation(message, round_index);
+        }
+    }
+
+    /// Record a successful file mutation (Edit / Write created|overwritten)
+    /// keyed by the normalized logical path.
+    fn record_mutation(&mut self, msg: &Message, round_index: usize) {
+        let MessageContent::ToolResult {
+            tool_name,
+            result,
+            result_for_assistant,
+            is_error,
+            ..
+        } = &msg.content
+        else {
+            return;
+        };
+        if *is_error || !FILE_MUTATION_TOOLS.contains(&tool_name.as_str()) {
+            return;
+        }
+        let success = result
+            .get("success")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        if !success {
+            return;
+        }
+        // A Write whose target already holds identical content
+        // (`status: already_exists_same_content`) does not change the file and
+        // must not invalidate cached reads.
+        if tool_name == "Write" {
+            let status = result
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("created");
+            if !matches!(status, "created" | "overwritten") {
+                return;
+            }
+        }
+        let Some(content) = result_for_assistant.as_ref().filter(|s| !s.is_empty()) else {
+            return;
+        };
+        if let Some(path) = file_path_from_result(tool_name, result, content) {
+            self.edited_files
+                .insert(normalize_path_key(&path), round_index);
+        }
     }
 
     /// Examine a tool-result `Message` that is about to be appended to the
@@ -131,23 +216,27 @@ impl TurnObservationDeduplicator {
         };
 
         // Record successful file mutations so later reads of the same path
-        // are kept fresh (see freshness guard below).
+        // are kept fresh. The execution engine additionally pre-scans the
+        // whole round before dedup (see `pre_scan_round_mutations`); keeping
+        // the recording here too makes standalone callers behave the same.
         if FILE_MUTATION_TOOLS.contains(&tool_name.as_str()) {
-            let success = result
-                .get("success")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(true);
-            if success {
-                if let Some(path) = file_path_from_result(tool_name, result, content) {
-                    self.edited_files.insert(path, round_index);
-                }
-            }
+            self.record_mutation(msg, round_index);
             return msg.clone();
         }
 
         let Some(key) = compute_dedup_key(content) else {
             return msg.clone();
         };
+
+        // Count explicit re-reads of files whose observations were replaced
+        // by a marker earlier in this turn (recovery reads).
+        if tool_name == READ_TOOL_NAME {
+            if let Some(path) = file_path_from_result(tool_name, result, content) {
+                if self.deduped_read_paths.contains(&normalize_path_key(&path)) {
+                    self.stats.recovery_reads += 1;
+                }
+            }
+        }
 
         if let Some(prior) = self.seen.get(&key) {
             let prior_round = prior.round_index;
@@ -167,18 +256,20 @@ impl TurnObservationDeduplicator {
             // would hide legitimate dedup of unchanged content.
             if tool_name == READ_TOOL_NAME {
                 if let Some(path) = file_path_from_result(tool_name, result, content) {
-                    if let Some(edited_round) = self.edited_files.get(&path).copied() {
+                    let path_key = normalize_path_key(&path);
+                    if let Some(edited_round) = self.edited_files.get(&path_key).copied() {
                         if edited_round > prior_round {
                             debug!(
                                 "Observation dedup skipped after edit: tool={}, round={}, edited_round={}, descriptor={:?}",
                                 tool_name, round_index, edited_round, prior_descriptor
                             );
+                            self.stats.skipped_after_edit += 1;
                             self.seen.insert(
                                 key,
                                 SeenObservation {
                                     round_index,
                                     tool_name: tool_name.clone(),
-                                    descriptor: build_descriptor(content),
+                                    descriptor: build_descriptor(tool_name, result, content),
                                 },
                             );
                             return msg.clone();
@@ -195,6 +286,19 @@ impl TurnObservationDeduplicator {
                 "[Observation deduped: identical content was already presented at round {} ({}: {}). Omitted to reduce context size. Call Read/Bash again if the content may have changed.]",
                 prior_round, prior_tool, prior_descriptor
             );
+            self.stats.replacements += 1;
+            if key.starts_with(PERSISTED_KEY_PREFIX) {
+                self.stats.persisted_hits += 1;
+            }
+            self.stats.chars_saved += content
+                .chars()
+                .count()
+                .saturating_sub(replacement.chars().count());
+            if tool_name == READ_TOOL_NAME {
+                if let Some(path) = file_path_from_result(tool_name, result, content) {
+                    self.deduped_read_paths.insert(normalize_path_key(&path));
+                }
+            }
             return replace_result_for_assistant(msg, replacement);
         }
 
@@ -204,7 +308,7 @@ impl TurnObservationDeduplicator {
             SeenObservation {
                 round_index,
                 tool_name: tool_name.clone(),
-                descriptor: build_descriptor(content),
+                descriptor: build_descriptor(tool_name, result, content),
             },
         );
         msg.clone()
@@ -213,35 +317,22 @@ impl TurnObservationDeduplicator {
     /// Call this whenever context compression fires so that future dedup
     /// references do not point at observations that no longer exist.
     ///
-    /// Markers that were already written into history are annotated so the
-    /// model knows their original observation may have been compacted away.
-    pub(crate) fn reset_after_compression(&mut self, messages: &mut [Message]) {
+    /// Only the index is cleared; history is not rewritten. Markers already
+    /// in history are self-describing (round + descriptor) and carry an
+    /// explicit "re-read if the content may have changed" instruction, so
+    /// they remain interpretable after compaction.
+    pub(crate) fn reset_after_compression(&mut self) {
+        self.stats.resets += 1;
         let count = self.seen.len();
         self.seen.clear();
-        // `edited_files` is intentionally kept: edit rounds remain valid
-        // chronological anchors after compression and keep the freshness
-        // guard working for future reads.
+        // `edited_files` and `deduped_read_paths` are intentionally kept:
+        // edit rounds stay valid chronological anchors, and recovery-read
+        // tracking spans compressions.
         if count > 0 {
             debug!(
                 "ObservationDeduplicator reset after compression: cleared {} entries",
                 count
             );
-        }
-
-        for message in messages.iter_mut() {
-            let MessageContent::ToolResult {
-                result_for_assistant,
-                ..
-            } = &mut message.content
-            else {
-                continue;
-            };
-            let Some(text) = result_for_assistant.as_mut() else {
-                continue;
-            };
-            if text.starts_with(DEDUP_MARKER_PREFIX) && !text.contains(COMPACTION_ANNOTATION) {
-                text.push_str(COMPACTION_ANNOTATION);
-            }
         }
     }
 }
@@ -257,15 +348,16 @@ impl TurnObservationDeduplicator {
 ///    emitted by `build_persisted_tool_output_message` and covers the full
 ///    persisted content plus metadata, so the key is exact and independent of
 ///    the UUID-based reference path.
-/// 2. **Legacy persisted outputs** (no hash line) — the reference line
-///    contains a UUID-based path that differs on every invocation, so we hash
-///    only the preview section. This is best effort: distinct contents with
-///    an identical preview would collide (new persisted outputs always carry
-///    the hash line to avoid this).
+/// 2. **Legacy persisted outputs (no hash line)** — deliberately **not**
+///    deduplicated. A preview-based key would collide whenever two outputs
+///    share the same visible preview but differ in the truncated portion,
+///    silently hiding a content difference. Such messages never deduplicated
+///    before the hash line existed either, so skipping them loses nothing.
 /// 3. **Plain outputs** — the full text.
 ///
 /// Returns `None` when the normalised content is shorter than `MIN_DEDUP_CHARS`
-/// (not worth tracking) or when the string is empty.
+/// (not worth tracking), when the string is empty, or for legacy persisted
+/// outputs.
 fn compute_dedup_key(result_for_assistant: &str) -> Option<String> {
     if let Some(hash) = parse_content_sha256(result_for_assistant) {
         // Persisted outputs are normally large, but round-budget persistence
@@ -274,18 +366,11 @@ fn compute_dedup_key(result_for_assistant: &str) -> Option<String> {
         if result_for_assistant.chars().count() < MIN_DEDUP_CHARS {
             return None;
         }
-        return Some(format!("persisted:{hash}"));
+        return Some(format!("{PERSISTED_KEY_PREFIX}{hash}"));
     }
 
     if result_for_assistant.starts_with(PERSISTED_OUTPUT_TAG) {
-        let canonical = legacy_persisted_canonical(result_for_assistant)?;
-        if canonical.chars().count() < MIN_DEDUP_CHARS {
-            return None;
-        }
-        return Some(format!(
-            "legacy-persisted:{}",
-            hex::encode(Sha256::digest(canonical.as_bytes()))
-        ));
+        return None;
     }
 
     if result_for_assistant.chars().count() < MIN_DEDUP_CHARS {
@@ -323,45 +408,87 @@ fn parse_content_sha256(text: &str) -> Option<String> {
     None
 }
 
-/// Canonical tail of a legacy persisted-output message: everything after the
-/// `Preview (first N chars):` header line, including any metadata section.
-///
-/// The search is bounded to the message header (first few lines) so a
-/// malformed message whose preview content contains a `Preview (first ...`
-/// line cannot yield a wrong canonical tail.
-fn legacy_persisted_canonical(text: &str) -> Option<&str> {
-    let mut offset = 0usize;
-    for line in text.split_inclusive('\n').take(16) {
-        if line.starts_with(PREVIEW_HEADER_PREFIX) {
-            return Some(&text[offset + line.len()..]);
-        }
-        offset += line.len();
-    }
-    None
-}
-
 // ────────────────────────────────────────────────────────────────────────────
 // Descriptor / path helpers
 // ────────────────────────────────────────────────────────────────────────────
 
-/// First meaningful line of an observation, truncated to keep markers short.
-fn build_descriptor(content: &str) -> String {
-    // For persisted outputs the first line is just the tag; for any output,
-    // skip leading blank lines so the descriptor is never empty (e.g. a Bash
-    // result whose output starts with a newline).
+/// Short, self-describing excerpt used in markers: a single clean line of at
+/// most `MAX_DESCRIPTOR_CHARS` characters.
+fn build_descriptor(tool_name: &str, result: &serde_json::Value, content: &str) -> String {
+    let raw = if tool_name == READ_TOOL_NAME {
+        // Prefer the structured source description (path + line range). It is
+        // available even for persisted results, whose visible text only
+        // carries the artifact reference.
+        source_read_descriptor(result, content)
+    } else {
+        first_meaningful_line(content).to_string()
+    };
+    sanitize_descriptor(&raw)
+}
+
+/// `Read lines {start}-{end} from {path} ({total} total lines)` built from
+/// the structured result, falling back to the first meaningful line of the
+/// visible content.
+fn source_read_descriptor(result: &serde_json::Value, content: &str) -> String {
+    if let (Some(path), Some(start), Some(lines_read)) = (
+        result.get("file_path").and_then(|value| value.as_str()),
+        result.get("start_line").and_then(|value| value.as_u64()),
+        result.get("lines_read").and_then(|value| value.as_u64()),
+    ) {
+        let end = if lines_read > 0 {
+            start + lines_read - 1
+        } else {
+            start
+        };
+        let total = result
+            .get("total_lines")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(end);
+        return format!("Read lines {start}-{end} from {path} ({total} total lines)");
+    }
+    first_meaningful_line(content).to_string()
+}
+
+/// First non-blank line of an observation. For persisted outputs the first
+/// line is just the tag, so it is skipped (the next meaningful line is the
+/// `Output too large (N chars)...` header).
+fn first_meaningful_line(content: &str) -> &str {
     let skip = usize::from(content.starts_with(PERSISTED_OUTPUT_TAG));
-    let first_line = content
+    content
         .lines()
         .skip(skip)
         .find(|line| !line.trim().is_empty())
-        .unwrap_or(content);
+        .unwrap_or(content)
+}
 
-    let truncated: String = first_line.chars().take(MAX_DESCRIPTOR_CHARS).collect();
-    if truncated.chars().count() < first_line.chars().count() {
+/// Collapse a descriptor to a single clean line: strip control characters
+/// (e.g. ANSI escapes in command output) and truncate to
+/// `MAX_DESCRIPTOR_CHARS`.
+fn sanitize_descriptor(text: &str) -> String {
+    let cleaned: String = text.chars().filter(|ch| !ch.is_control()).collect();
+    let trimmed = cleaned.trim();
+    let truncated: String = trimmed.chars().take(MAX_DESCRIPTOR_CHARS).collect();
+    if truncated.chars().count() < trimmed.chars().count() {
         format!("{truncated}…")
     } else {
         truncated
     }
+}
+
+/// Canonical key for a logical file path used by the edit-freshness map and
+/// the recovery-read set.
+///
+/// Paths produced by the workspace resolver are already consistent
+/// (workspace-relative logical paths), but defensive normalization keeps a
+/// `./`-prefixed or whitespace-padded variant of the same path on the same
+/// key. Absolute paths are intentionally not resolved: distinct files must
+/// never be merged.
+fn normalize_path_key(path: &str) -> String {
+    let mut trimmed = path.trim();
+    while let Some(stripped) = trimmed.strip_prefix("./") {
+        trimmed = stripped;
+    }
+    trimmed.to_string()
 }
 
 /// Logical path associated with a tool result, when determinable.
@@ -479,6 +606,9 @@ mod tests {
         let mut data = json!({
             "content": content,
             "file_path": file_path,
+            "start_line": 1,
+            "lines_read": 50,
+            "total_lines": 100,
         });
         if let Some(success) = success {
             data["success"] = json!(success);
@@ -488,6 +618,53 @@ mod tests {
             tool_name: tool_name.to_string(),
             result: data,
             result_for_assistant: Some(content.to_string()),
+            is_error: false,
+            duration_ms: None,
+            image_attachments: None,
+        };
+        Message::tool_result(result)
+    }
+
+    fn make_write_result(path: &str, status: &str) -> Message {
+        let content = format!("Write result for {path}");
+        let result = ToolResult {
+            tool_id: format!("id-{}", uuid::Uuid::new_v4()),
+            tool_name: "Write".to_string(),
+            result: json!({
+                "file_path": path,
+                "success": true,
+                "status": status,
+                "bytes_written": if status == "created" || status == "overwritten" { 10 } else { 0 },
+            }),
+            result_for_assistant: Some(content),
+            is_error: false,
+            duration_ms: None,
+            image_attachments: None,
+        };
+        Message::tool_result(result)
+    }
+
+    fn read_message(path: &str, body: &str, round_lines: bool) -> Message {
+        let start = 1;
+        let end = 50;
+        let total = 100;
+        let header = format!("Read lines {start}-{end} from {path} ({total} total lines)");
+        let content = if round_lines {
+            format!("{header}\n<file_content>\n{body}\n</file_content>")
+        } else {
+            body.to_string()
+        };
+        let result = ToolResult {
+            tool_id: format!("id-{}", uuid::Uuid::new_v4()),
+            tool_name: "Read".to_string(),
+            result: json!({
+                "content": content,
+                "file_path": path,
+                "start_line": start,
+                "lines_read": end - start + 1,
+                "total_lines": total,
+            }),
+            result_for_assistant: Some(content),
             is_error: false,
             duration_ms: None,
             image_attachments: None,
@@ -608,8 +785,7 @@ mod tests {
         let msg = make_tool_result_message("Read", &content, false);
         let _ = dedup.apply(&msg, 1);
 
-        let mut messages = vec![msg.clone()];
-        dedup.reset_after_compression(&mut messages);
+        dedup.reset_after_compression();
 
         // After reset, the same content is treated as new.
         let msg2 = make_tool_result_message("Read", &content, false);
@@ -618,26 +794,6 @@ mod tests {
         assert!(
             !is_dedup_marker(text),
             "after compression reset, same content should be treated as new"
-        );
-    }
-
-    #[test]
-    fn marker_is_annotated_after_compression() {
-        let mut dedup = TurnObservationDeduplicator::new();
-        let content = large(1000);
-        let msg = make_tool_result_message("Read", &content, false);
-        let _ = dedup.apply(&msg, 1);
-        let msg2 = make_tool_result_message("Read", &content, false);
-        let out = dedup.apply(&msg2, 2);
-
-        let mut messages = vec![msg, out.clone()];
-        dedup.reset_after_compression(&mut messages);
-
-        let text = result_text(&messages[1]).unwrap_or_default();
-        assert!(is_dedup_marker(text));
-        assert!(
-            text.contains("context was compacted"),
-            "surviving marker should be annotated: {text}"
         );
     }
 
@@ -692,7 +848,36 @@ mod tests {
     }
 
     #[test]
-    fn legacy_persisted_output_without_hash_deduped_by_preview() {
+    fn persisted_hash_covers_middle_content_change() {
+        // Same preview (first 2000 chars), same total length, same line
+        // count — but the content after the preview differs. The full-content
+        // hash must catch the difference.
+        let mut dedup = TurnObservationDeduplicator::new();
+        let body1 = format!("{}A{}", large(2000), large(1000));
+        let body2 = format!("{}B{}", large(2000), large(1000));
+        assert_eq!(body1.chars().count(), body2.chars().count());
+        assert_eq!(body1.lines().count(), body2.lines().count());
+
+        let msg1 = make_tool_result_message(
+            "Read",
+            &persisted_message(&body1, "aabbccdd", Some(&sha256_hex(&body1))),
+            false,
+        );
+        let _ = dedup.apply(&msg1, 1);
+        let msg2 = make_tool_result_message(
+            "Read",
+            &persisted_message(&body2, "11223344", Some(&sha256_hex(&body2))),
+            false,
+        );
+        let out = dedup.apply(&msg2, 2);
+        assert!(
+            !is_dedup_marker(result_text(&out).unwrap_or_default()),
+            "content change beyond the preview must not be deduplicated"
+        );
+    }
+
+    #[test]
+    fn legacy_persisted_output_without_hash_is_safely_skipped() {
         let mut dedup = TurnObservationDeduplicator::new();
         let content = large(3000);
         let msg1 = make_tool_result_message(
@@ -708,8 +893,8 @@ mod tests {
         );
         let out = dedup.apply(&msg2, 2);
         assert!(
-            is_dedup_marker(result_text(&out).unwrap_or_default()),
-            "legacy persisted outputs with identical preview must dedup"
+            !is_dedup_marker(result_text(&out).unwrap_or_default()),
+            "legacy persisted outputs without a content hash must be skipped"
         );
     }
 
@@ -757,6 +942,56 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_strips_control_characters() {
+        let mut dedup = TurnObservationDeduplicator::new();
+        let content = format!("\x1b[31mred text\x1b[0m\n{}", large(1000));
+        let msg1 = make_tool_result_message("Bash", &content, false);
+        let _ = dedup.apply(&msg1, 1);
+        let msg2 = make_tool_result_message("Bash", &content, false);
+        let out = dedup.apply(&msg2, 2);
+        let text = result_text(&out).unwrap_or_default();
+        assert!(
+            text.contains("red text"),
+            "descriptor should keep visible text: {text}"
+        );
+        assert!(
+            !text.contains('\x1b'),
+            "descriptor must not contain ANSI escapes: {text}"
+        );
+    }
+
+    #[test]
+    fn descriptor_uses_source_path_for_persisted_read() {
+        let mut dedup = TurnObservationDeduplicator::new();
+        let body = large(3000);
+        let sha = sha256_hex(&body);
+        let persisted = persisted_message(&body, "aabbccdd", Some(&sha));
+        let msg1 = read_message("src/lib.rs", &persisted, false);
+        let _ = dedup.apply(&msg1, 1);
+        let msg2 = read_message("src/lib.rs", &persisted, false);
+        let out = dedup.apply(&msg2, 2);
+        let text = result_text(&out).unwrap_or_default();
+        assert!(
+            text.contains("Read lines 1-50 from src/lib.rs (100 total lines)"),
+            "persisted read marker must cite the source file, got: {text}"
+        );
+    }
+
+    #[test]
+    fn same_content_different_paths_do_not_dedup_for_read() {
+        let mut dedup = TurnObservationDeduplicator::new();
+        let body = large(1000);
+        let msg1 = read_message("src/a.rs", &body, true);
+        let _ = dedup.apply(&msg1, 1);
+        let msg2 = read_message("src/b.rs", &body, true);
+        let out = dedup.apply(&msg2, 2);
+        assert!(
+            !is_dedup_marker(result_text(&out).unwrap_or_default()),
+            "Read results from different files must not dedup"
+        );
+    }
+
+    #[test]
     fn read_after_edit_is_kept_fresh_then_rebases() {
         let mut dedup = TurnObservationDeduplicator::new();
         let path = "src/lib.rs";
@@ -793,6 +1028,82 @@ mod tests {
     }
 
     #[test]
+    fn write_skipped_does_not_suppress_dedup() {
+        let mut dedup = TurnObservationDeduplicator::new();
+        let body = large(1000);
+        let read = read_message("src/lib.rs", &body, true);
+
+        let _ = dedup.apply(&read, 1);
+        // A Write that found identical content must not invalidate the read.
+        let skipped = make_write_result("src/lib.rs", "already_exists_same_content");
+        let _ = dedup.apply(&skipped, 2);
+        let out = dedup.apply(&read, 3);
+        assert!(
+            is_dedup_marker(result_text(&out).unwrap_or_default()),
+            "write-skipped must not suppress dedup"
+        );
+
+        // A real Write (created) must invalidate the read.
+        let mut dedup = TurnObservationDeduplicator::new();
+        let _ = dedup.apply(&read, 1);
+        let created = make_write_result("src/lib.rs", "created");
+        let _ = dedup.apply(&created, 2);
+        let out = dedup.apply(&read, 3);
+        assert!(
+            !is_dedup_marker(result_text(&out).unwrap_or_default()),
+            "write-created must keep the read fresh"
+        );
+    }
+
+    #[test]
+    fn path_normalization_matches_dot_prefix() {
+        let mut dedup = TurnObservationDeduplicator::new();
+        let body = large(1000);
+        let read = read_message("src/lib.rs", &body, true);
+        let edit = make_tool_result_with_path(
+            "Edit",
+            "Successfully edited ./src/lib.rs",
+            "./src/lib.rs",
+            Some(true),
+        );
+
+        let _ = dedup.apply(&read, 1);
+        let _ = dedup.apply(&edit, 2);
+        let out = dedup.apply(&read, 3);
+        assert!(
+            !is_dedup_marker(result_text(&out).unwrap_or_default()),
+            "normalized paths must match across ./ prefixes"
+        );
+    }
+
+    #[test]
+    fn pre_scan_round_mutations_makes_same_round_edits_visible() {
+        let mut dedup = TurnObservationDeduplicator::new();
+        let body = large(1000);
+        let read = read_message("src/lib.rs", &body, true);
+        let edit = make_tool_result_with_path(
+            "Edit",
+            "Successfully edited src/lib.rs",
+            "src/lib.rs",
+            Some(true),
+        );
+
+        // Round 1: first read is stored.
+        let _ = dedup.apply(&read, 1);
+
+        // Round 2: messages arrive as [read, edit]; without the pre-scan the
+        // duplicate read would be deduped against round 1 even though the
+        // edit happened in the same round.
+        let round_messages = vec![read.clone(), edit.clone()];
+        dedup.pre_scan_round_mutations(&round_messages, 2);
+        let out = dedup.apply(&read, 2);
+        assert!(
+            !is_dedup_marker(result_text(&out).unwrap_or_default()),
+            "same-round edit must keep the read fresh"
+        );
+    }
+
+    #[test]
     fn failed_edit_does_not_suppress_dedup() {
         let mut dedup = TurnObservationDeduplicator::new();
         let path = "src/lib.rs";
@@ -812,6 +1123,65 @@ mod tests {
             is_dedup_marker(result_text(&out).unwrap_or_default()),
             "failed edit must not block dedup"
         );
+    }
+
+    #[test]
+    fn dedup_stats_count_replacements_recovery_and_savings() {
+        let mut dedup = TurnObservationDeduplicator::new();
+        let body = large(1000);
+        let read = read_message("src/lib.rs", &body, true);
+
+        let _ = dedup.apply(&read, 1);
+        let out = dedup.apply(&read, 2);
+        assert!(is_dedup_marker(result_text(&out).unwrap_or_default()));
+        let out = dedup.apply(&read, 3);
+        assert!(is_dedup_marker(result_text(&out).unwrap_or_default()));
+
+        let edit = make_tool_result_with_path(
+            "Edit",
+            "Successfully edited src/lib.rs",
+            "src/lib.rs",
+            Some(true),
+        );
+        let _ = dedup.apply(&edit, 4);
+        let out = dedup.apply(&read, 5);
+        assert!(!is_dedup_marker(result_text(&out).unwrap_or_default()));
+
+        dedup.reset_after_compression();
+        let stats = dedup.take_stats();
+        assert_eq!(stats.replacements, 2);
+        assert_eq!(stats.skipped_after_edit, 1);
+        assert_eq!(stats.resets, 1);
+        assert_eq!(
+            stats.recovery_reads, 2,
+            "reads 3 and 5 re-read a deduped path"
+        );
+        assert!(stats.chars_saved > 0);
+        assert_eq!(stats.persisted_hits, 0);
+    }
+
+    #[test]
+    fn persisted_hits_are_counted() {
+        let mut dedup = TurnObservationDeduplicator::new();
+        let content = large(3000);
+        let sha = sha256_hex(&content);
+        let msg1 = make_tool_result_message(
+            "Read",
+            &persisted_message(&content, "aabbccdd", Some(&sha)),
+            false,
+        );
+        let _ = dedup.apply(&msg1, 1);
+        let msg2 = make_tool_result_message(
+            "Read",
+            &persisted_message(&content, "11223344", Some(&sha)),
+            false,
+        );
+        let _ = dedup.apply(&msg2, 2);
+
+        let stats = dedup.take_stats();
+        assert_eq!(stats.replacements, 1);
+        assert_eq!(stats.persisted_hits, 1);
+        assert!(stats.chars_saved > 0);
     }
 
     #[test]

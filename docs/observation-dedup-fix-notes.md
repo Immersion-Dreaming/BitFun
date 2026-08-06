@@ -224,3 +224,100 @@
 - `working_directory`/`terminal_session_id` 进 hash 会压低跨上下文 Bash 去重命中率（M3）。
 - 历史会话中的旧 marker 仍引用错位 position，不做迁移（turn 级影响有限，L4）。
 - 持久化去重后 marker 不携带原始 reference，压缩后模型只能重跑（L5）。
+
+## 9. 第三轮审核与修复（2026-08-06，按外部专家 Fix 1–6 清单执行）
+
+第三轮针对外部专家对前两轮提交的逐项审核意见（Fix 1–6）落地修复，核心思路：
+**去掉基于消息位置的引用、去掉有碰撞风险的 preview fallback、让 marker 自描述、让编辑感知更准确，
+并补上结构化 telemetry 与针对性测试。**
+
+### Fix 1（采纳方案 A）：删除 legacy persisted fallback，缺失全量 hash 时不去重
+
+- `PersistedToolOutput` 已增加 `content_sha256`（第二轮落地），
+  `build_persisted_tool_output_message()` 在头部输出 `Content sha256: ...` 行，
+  该行位于 `Preview (first N chars):` 边界之前。
+- `compute_dedup_key` 现在：
+  - 以 `<persisted-output>` 常量解析（不再匹配旧的 `[PERSISTED_OUTPUT` 假格式）；
+  - 优先从头部解析 `Content sha256` → key 为 `persisted:<hash>`；
+  - 旧格式 `persisted-output` 消息**缺少 hash 时直接返回 `None` 不去重**
+    （删除原先 `preview + original_chars + line_count` 的 best-effort 回退，
+    该回退在 preview/长度/行数相同但中间内容不同时仍会误去重，不能称为零碰撞）；
+  - 普通输出仍按全量 sha256 去重；
+  - persisted 路径同样要求内容 ≥ `MIN_DEDUP_CHARS`，与 plain 路径对齐。
+- 测试：`legacy_persisted_output_without_hash_is_safely_skipped`、
+  `persisted_hash_covers_middle_content_change`（preview、长度、行数相同但中间内容不同 → 不去重）、
+  `preview_hash_lookalike_is_not_used_as_dedup_key` 继续有效。
+
+### Fix 2：marker 完全自描述，彻底移除位置引用
+
+- `apply()` 不接收任何消息位置参数（第二轮已删除 `current_messages_len`），
+  本轮确认引擎侧无残留位置写入。
+- `build_descriptor` 按工具类型构造结构化描述：
+  - Read：从结构化结果提取 `file_path / start_line / lines_read / total_lines`，
+    生成 `Read lines {start}-{end} from {path} ({total} total lines)`；
+  - **持久化 Read 也从原始结果提取源文件描述**，而不是写 artifact 路径
+    （`descriptor_uses_source_path_for_persisted_read` 覆盖）；
+  - 其他工具取第一个非空行；
+  - `sanitize_descriptor` 统一做单行化、控制字符清理（ANSI 等）、trim 与 120 字符截断。
+- marker 保留 `round`（稳定时间锚点），不再保留任何 context position。
+
+### Fix 3：编辑感知细化
+
+- `record_mutation`：
+  - Write 仅 `created / overwritten` 视为文件变更；
+    **`already_exists_same_content`（Write skipped, identical content）不记录**
+    （已核实 `write_file.rs` 语义），避免跳过内容相同的写入却抑制去重；
+  - Edit 仍按 `success` 记录，失败 Edit 不抑制去重（`failed_edit_does_not_suppress_dedup`）。
+- 路径 key 统一规范化：`normalize_path_key` trim + 去除 `./` 前缀，相对/带前缀路径映射到同一 key
+  （`path_normalization_matches_dot_prefix`）。
+- 新增 `pre_scan_round_mutations(&messages, round_index)`：引擎在每轮 apply 循环前先扫描
+  成功编辑结果，保证同一 round 内（如并行工具调用）先 Edit 再 Read 时，
+  Read 看到的是"已编辑"状态（`pre_scan_round_mutations_makes_same_round_edits_visible`）。
+- 明确未覆盖场景：Bash 内部修改、外部进程、远程工作区修改无法被该 map 覆盖（见遗留事项）。
+
+### Fix 4：压缩后不再改写历史 marker
+
+- `reset_after_compression()` 改为**无参**，只清空 `seen` 索引；
+  `edited_files` 与 `deduped_read_paths` 保留（编辑 round 是稳定锚点，新鲜度保护继续生效）。
+- 不再对压缩后幸存的历史 marker 做任何改写：Fix 2 的自描述 marker 无需位置迁移即可解释，
+  同时避免上下文重写带来的 cache miss。
+- 已核实：压缩后 `messages = compressed_messages` 本来就不回写 session cache，
+  原"标注幸存 marker"逻辑收益极低，删除安全。
+
+### Fix 5：结构化 telemetry（不含配置开关）
+
+- 新增 `DedupStats`：`replacements / persisted_hits / skipped_after_edit / resets /
+  recovery_reads / chars_saved` 六个计数器。
+- 引擎在每次 turn 循环结束后调用 `take_stats()` 并通过 `info!` 上报
+  （`Turn observation dedup stats: ...`），不再依赖 debug 日志计数。
+- 可配置开关（开关、阈值进 `AIConfig`）暂未做：需要把配置从 service 层透传到
+  execution engine，改动面较大，继续列入遗留事项。
+- `recovery_reads` 语义：本 turn 内对"曾被子去重路径"的 Read 计数（含去重读本身与编辑后的新鲜读），
+  用于评估去重是否扰动 agent 执行路径。
+
+### Fix 6：测试补充
+
+`observation_dedup` 模块测试 23 个全部通过，本轮新增/改写覆盖：
+- 同样内容、不同文件路径不互相去重（`same_content_different_paths_do_not_dedup_for_read`）；
+- 同一文件被去重后再次显式 Read 返回完整内容并 rebase（`read_after_edit_is_kept_fresh_then_rebases`）；
+- 旧格式无 hash 安全跳过去重；`Content sha256` 覆盖中间内容变化；
+- 真实 `<persisted-output>` / `Preview (first N chars):` 格式（不再用旧假格式）；
+- Write skipped 不去抑制去重、路径规范化、同 round 预扫描、失败 Edit、stats 计数、persisted hits 计数。
+
+### 验证结果
+
+- `cargo test -p bitfun-core --lib observation_dedup`：23 passed。
+- `cargo test -p bitfun-core --lib agentic::tools::tool_result_storage`：7 passed
+  （含 H3 端到端 persisted 管道测试）。
+- `cargo test -p bitfun-agent-tools`：100 passed。
+- `cargo test -p bitfun-core --lib`：1007 passed / 8 failed —— 8 个失败仍为存量失败
+  （`canvas_tools` 7 + `git_adapter` 1，干净基线已复现，与本次改动无关）。
+- 真实 trace 重分析（`/tmp/dedup_full_sim.py`，21 任务）：15 个旧 marker 的去重决策全部保留，
+  0 次新鲜度抑制；无新增误去重（模拟中唯一"新事件"为 `[TOOL ERROR]` 消息，生产按 `is_error` 排除）。
+- `cargo fmt -p bitfun-core` 后已还原被误格式化的无关文件 `infrastructure/storage/cleanup.rs`。
+
+### 提交说明
+
+- 分支：`feat/observation-dedup`
+- 本轮提交：`fix(execution): third-round observation dedup hardening per expert review`
+  （含 engine 调用点、去重器重写、文档；详见 git log）。

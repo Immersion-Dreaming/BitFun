@@ -1,0 +1,190 @@
+# Observation Dedup 修复方案与执行记录
+
+> 分支：`feat/observation-dedup`　日期：2026-08-06
+> 本文档记录跨 round 观察去重功能的缺陷分析、修复方案、代码改动与验证结果，便于后续复盘。
+
+---
+
+## 1. 背景
+
+`feat/observation-dedup` 引入的 `TurnObservationDeduplicator`
+（`src/crates/assembly/core/src/agentic/execution/observation_dedup.rs`）用于在单次
+`execute_turn` 内对内容完全相同的工具结果（Read / Bash 等）做去重：首次出现时完整存储，
+后续重复出现时替换为一行 `[Observation deduped: ...]` marker，节省上下文 token。
+
+通过代码审查 + 真实 benchmark trace（`observation-dedup-Deduplicate—rerun`，21 个任务、
+每个任务多个 agent 运行目录）分析，发现以下问题。
+
+## 2. 问题根因分析
+
+### P0-1（死代码）：持久化输出永远不会命中去重
+
+- 生产格式由 `build_persisted_tool_output_message`
+  （`src/crates/execution/tool-contracts/src/tool_result_storage.rs`）生成，实际为：
+
+  ```
+  <persisted-output>
+  Output too large (N chars). Full output saved to: .../tool-results/<uuid>.txt
+  Line count: N
+  Content sha256: ...（本次新增）
+  Preview (first 2000 chars):
+  <preview>
+  </persisted-output>
+  ```
+
+- `compute_dedup_key` 却按 `"[PERSISTED_OUTPUT"` 前缀判断、并查找 `"---Preview"` 标记：
+  - 前缀判断与生产 tag `<persisted-output>` 不一致；
+  - `find("---Preview")` 恒为 `None`（生产格式是 `Preview (first 2000 chars):`）。
+  - 结果：持久化输出永远走"整串 hash"回退路径，hash 包含 UUID 路径 → **永不命中去重**。
+- 内嵌测试使用了假格式（`[PERSISTED_OUTPUT: ...] ---Preview (first 2000 chars)---`），
+  测试通过但生产失效，属于"测试与生产格式脱节"的典型问题。
+
+### P0-2（位置偏移）：marker 引用的 context position 全部漂移
+
+- 记录索引用的是执行期 `messages.len()`（不含发送前注入的提醒），
+  而实际发请求时 `build_ai_messages_for_send` 会在 system 之后临时注入 5 条提醒
+  （collapsed tool/skill/agent listing、runtime context、user context，
+  见 `agent-runtime/src/prompt.rs::PrependedPromptReminders::ordered_reminders`）。
+- 实测：所有去重事件中 marker 引用位置比真实原始内容位置 **+5**（9/9 精确命中偏移后的位置），
+  即模型看到的"context position N"是错的；cattrs 任务里 marker 写 `position 8`、
+  实际原始内容在 `position 13`。
+- 影响：模型可能根据错误位置找不到原始内容，或误读其他消息。
+
+### P1-1：marker 无内容描述
+
+旧 marker 只写 `(round N, Read)`，模型无法判断被省略的内容是什么，只能盲目重读。
+
+### P1-2：编辑后重读无新鲜度保护
+
+若某文件在原始观察之后被 Edit/Write 修改，随后对同一路径的 Read 只要内容 hash 相同
+（例如编辑发生在读取范围之外、或内容被改回原样）就会被去重，模型拿不到"编辑后仍一致"
+的新鲜确认。
+
+### P1-3：压缩后 marker 悬空
+
+上下文压缩后 `reset_after_compression` 只清空 `seen` map，历史里已写入的 marker 仍引用
+可能已被压缩掉的原始内容。
+
+### P2：preview 哈希碰撞
+
+旧逻辑只对 preview 部分 hash，两个内容不同但 preview 相同（前 2000 字符一致）的输出会被
+误判为相同。
+
+## 3. 修复方案（已实施）
+
+### Fix 1：持久化输出头部注入全量内容哈希（解决 P0-1 + P2）
+
+- `PersistedToolOutput` 新增 `content_sha256: String` 字段；
+  `persist_tool_result` 在持久化时对**完整序列化内容 + metadata** 计算 sha256 写入。
+- `build_persisted_tool_output_message` 在头部渲染 `Content sha256: <hex>` 行
+  （hash 为空时省略该行，保持旧格式兼容）。
+- `compute_dedup_key` 解析优先级：
+  1. 命中 `Content sha256:` 行（仅限 `<persisted-output>` 头部 16 行内，校验 64 位 hex）
+     → key = `persisted:<hash>`，精确且与 UUID 路径无关；
+  2. 旧格式（无 hash 行）→ 取 `Preview (first N chars):` 之后的尾部（含 metadata）hash，
+     key = `legacy-persisted:<hash>`，作为兼容回退；
+  3. 普通输出 → 全量 hash，key = `plain:<hash>`。
+- 不同 key 命名空间隔离，避免跨格式误命中。
+- 说明：metadata（`exit_code`、`working_directory` 等）也参与 hash——它们是可见内容的一部分，
+  相同的输出但不同的执行上下文不应去重。
+
+### Fix 2：marker 自描述化、彻底去掉 position（解决 P0-2 + P1-1）
+
+- `SeenObservation` 移除 `msg_index`，改为记录 `round_index` + `descriptor`。
+- `descriptor` = 原始内容首个有意义行（持久化输出取头部第一行描述），截断到 120 字符。
+- 新 marker 格式：
+
+  ```
+  [Observation deduped: identical content was already presented at round N (Read: Read lines 1-37 from /app/src/schema/types/schemaProps.ts (37 total lines)). Omitted to reduce context size. Call Read/Bash again if the content may have changed.]
+  ```
+
+- round 是稳定时间锚点，不随提醒注入 / 压缩而漂移。
+- `apply()` 签名同步简化：删除 `current_messages_len` 参数（该参数正是 position 漂移的来源）。
+
+### Fix 3：编辑感知（解决 P1-2）
+
+- 新增 `edited_files: HashMap<path, round>`。
+- Edit / Write 成功结果（结构化 `file_path`，回退解析 `Successfully edited <path>` /
+  `Successfully created <path>`）记录 `path -> round`；`success=false` 不记录。
+- Read 命中去重时，若该路径在原始观察 round 之后被编辑过 → **不去重**，完整展示本次读取，
+  并把 `seen` 记录 rebase 到当前 round（后续读取可继续针对"新鲜的那次"去重）。
+- 局限：通过 Bash（`sed -i`、`git checkout` 等）的文件变更无法感知，文档注明。
+
+### Fix 4：压缩时标注幸存 marker（解决 P1-3）
+
+- `reset_after_compression` 改为接收 `&mut [Message]`：清空 `seen`（保留 `edited_files`，
+  编辑 round 在压缩后仍是有效时间锚点），并对历史中已存在的 marker 追加：
+
+  ```
+  [Note: context was compacted since this observation; the original content may no longer be in history. Re-read if needed.]
+  ```
+
+### Fix 5/6（本次未实施，见第 6 节）
+
+- 可配置开关 / 阈值（接入 AIConfig）本次未做，保持默认行为；改动面大、收益不确定，列为后续项。
+
+## 4. 改动明细
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/crates/execution/tool-contracts/src/tool_result_storage.rs` | `PersistedToolOutput` 新增 `content_sha256`；`build_persisted_tool_output_message` 渲染 hash 行 |
+| `src/crates/assembly/core/src/agentic/tools/tool_result_storage.rs` | 持久化时计算 `compute_persisted_content_sha256`（内容+metadata）；测试断言 hash 行 |
+| `src/crates/assembly/core/src/agentic/execution/observation_dedup.rs` | 重写 key 计算、marker、编辑感知、压缩标注；13 个单元测试 |
+| `src/crates/assembly/core/src/agentic/execution/execution_engine.rs` | 适配 `apply(msg, round)` 与 `reset_after_compression(&mut messages)` |
+| `src/crates/execution/tool-contracts/tests/tool_contracts.rs` | 持久化消息测试补 hash 行断言 + 空 hash 省略行测试 |
+
+## 5. 测试与验证
+
+### 单元测试（全部通过）
+
+- `observation_dedup`：13 个测试（首现不变、重复替换、marker 自描述无 position、
+  阈值、错误不参与、压缩重置、压缩标注、持久化同内容去重 / 不同内容不去重、
+  旧格式 preview 回退、编辑后保持新鲜并 rebase、失败编辑不抑制去重、不同内容不去重）。
+- `tool_contracts`：2 个持久化消息格式测试（hash 行渲染 / 空 hash 省略）。
+- `bitfun-core::agentic::tools::tool_result_storage`：6 个持久化测试（含 hash 行断言）。
+
+### 全量回归
+
+- `cargo test -p bitfun-agent-tools`：44 + 100 全部通过。
+- `cargo test -p bitfun-core --lib`：996 通过 / 8 失败 —— 8 个失败均为存量失败
+  （`canvas_tools` 7 个 + `git_adapter` 1 个），已在干净基线（stash 后）复现，与本次改动无关。
+
+### 真实 trace 重分析（20 次 benchmark 运行）
+
+- 旧逻辑共 15 个去重 marker（9 个唯一内容事件，原始内容 895 ~ 14,140 字符，
+  全部为 Read 结果，此前已逐条验证与原始内容完全一致）。
+- **新逻辑下全部 15 个去重决策保留**，无回退、无新增误去重
+  （模拟发现的唯一"新事件"是 `[TOOL ERROR]` 错误消息，生产按 `is_error` 排除，不会去重）。
+- **新鲜度保护 0 次触发**：这批运行中不存在"文件编辑后内容 hash 仍相同"的重读场景，
+  说明 Fix 3 只增加安全性、不减少现有去重收益。
+- 这批运行中持久化输出没有出现重复（P0-1 是潜在缺陷、未被激活）；Fix 1 的正确性由单元测试覆盖，
+  并保证未来出现重复大输出（如反复跑超长测试/命令）时能正确去重。
+- 新 marker 实测示例（dynamodb-toolbox）：
+
+  ```
+  [Observation deduped: identical content was already presented at round 2 (Read: Read lines 1-37 from /app/src/schema/types/schemaProps.ts (37 total lines)). Omitted to reduce context size. Call Read/Bash again if the content may have changed.]
+  ```
+
+## 6. 遗留事项与后续建议
+
+1. **可配置化（Fix 5/6）**：将 `MIN_DEDUP_CHARS`、启用开关接入 `AIConfig`，
+   需要把配置从 service 层透传到 execution engine，改动面较大，建议独立评审后再做。
+2. **命令类文件变更感知**：Bash 内 `sed -i` / `git checkout` 等对文件的修改无法被
+   `edited_files` 记录；如需覆盖，可考虑对 Bash 结果做变更路径启发式提取（风险较高，暂缓）。
+3. **压缩边界观测**：目前压缩时统一 reset + 标注；若后续希望压缩后保留部分 seen 状态，
+   需要压缩逻辑返回"被保留的原始消息"清单。
+4. **跨 turn 去重**：去重器生命周期为单 `execute_turn`，跨 turn 复用需要持久化 key 索引，
+   收益与风险需单独评估。
+
+## 7. 复盘记录
+
+- **决策 1**：content hash 覆盖"序列化内容 + metadata"，而不是仅内容——metadata 是可见消息的一部分
+  （如 `exit_code`），不纳入会导致"相同输出、不同退出码"被错误去重。
+- **决策 2**：`edited_files` 在压缩 reset 时**保留**——编辑 round 是稳定时间锚点，
+  保留可让压缩后的新鲜度保护继续生效。
+- **决策 3**：`apply()` 删除 `current_messages_len` 参数——它正是 position 漂移的根源，
+  保留只会诱导未来再次引用消息位置。
+- **决策 4**：旧格式持久化输出仍按 preview 尾部 hash 回退匹配（best effort，
+  存在 preview 碰撞风险但仅影响旧历史消息；新消息一律带全量 hash）。
+- **执行情况**：方案经专家评审后实施；代码、测试、文档一次提交（见 git log）；
+  未做配置化与跨 turn 功能，符合"最小正确改动"原则。

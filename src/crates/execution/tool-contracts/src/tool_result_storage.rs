@@ -34,6 +34,12 @@ pub struct PersistedToolOutput {
     pub preview: String,
     pub has_more: bool,
     pub metadata: Vec<(String, String)>,
+    /// sha256 over the full persisted content plus its metadata. Rendered as
+    /// `Content sha256: ...` in the message header so consumers can build an
+    /// exact content-addressable key without hashing the truncated preview.
+    /// May be empty when a caller does not compute a hash; the rendered
+    /// message then omits the line (legacy shape).
+    pub content_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,9 +120,16 @@ pub fn build_persisted_tool_output_message(
     preview_chars: usize,
 ) -> String {
     let mut message = format!(
-        "{PERSISTED_OUTPUT_TAG}\nOutput too large ({} chars). Full output saved to: {}\nLine count: {}\n\nPreview (first {} chars):\n{}",
-        result.original_chars, result.reference, result.line_count, preview_chars, result.preview
+        "{PERSISTED_OUTPUT_TAG}\nOutput too large ({} chars). Full output saved to: {}\nLine count: {}\n",
+        result.original_chars, result.reference, result.line_count
     );
+    if !result.content_sha256.is_empty() {
+        message.push_str(&format!("Content sha256: {}\n", result.content_sha256));
+    }
+    message.push_str(&format!(
+        "\nPreview (first {} chars):\n{}",
+        preview_chars, result.preview
+    ));
     if result.has_more {
         message.push_str("\n...\n");
     } else {

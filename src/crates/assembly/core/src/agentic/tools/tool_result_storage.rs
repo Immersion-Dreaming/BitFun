@@ -16,6 +16,7 @@ use bitfun_agent_tools::{
 #[cfg(test)]
 use bitfun_agent_tools::{DEFAULT_MAX_TOOL_RESULT_CHARS, PERSISTED_OUTPUT_TAG};
 use log::{debug, warn};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -187,6 +188,8 @@ async fn persist_tool_result(
         )
         .unwrap_or_else(|_| path.display().to_string());
     let (preview, has_more) = generate_tool_result_preview(&serialized, preview_chars);
+    let metadata = tool_result_metadata(result);
+    let content_sha256 = compute_persisted_content_sha256(&serialized, &metadata);
 
     debug!(
         "Persisted oversized tool result: tool_name={}, tool_id={}, chars={}, path={}",
@@ -202,8 +205,28 @@ async fn persist_tool_result(
         line_count: count_tool_result_lines(&serialized),
         preview,
         has_more,
-        metadata: tool_result_metadata(result),
+        metadata,
+        content_sha256,
     })
+}
+
+/// sha256 over the full persisted content and its metadata.
+///
+/// Metadata (e.g. `exit_code`, `working_directory`) is part of the visible
+/// message, so it participates in the content address: two results with
+/// identical output but different execution context must not deduplicate.
+/// The hash is stable across runs, unlike the UUID-based reference path, so
+/// the deduplicator can match unchanged content exactly.
+fn compute_persisted_content_sha256(serialized: &str, metadata: &[(String, String)]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(serialized.as_bytes());
+    for (key, value) in metadata {
+        hasher.update(key.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(value.as_bytes());
+        hasher.update([0u8]);
+    }
+    hex::encode(hasher.finalize())
 }
 
 async fn write_once(path: &Path, content: &str) -> BitFunResult<()> {
@@ -426,6 +449,10 @@ mod tests {
         assert!(assistant.starts_with(PERSISTED_OUTPUT_TAG));
         assert!(assistant.contains("Full output saved to:"));
         assert!(assistant.contains("Preview"));
+        assert!(
+            assistant.contains("Content sha256: "),
+            "persisted message must carry a full-content hash"
+        );
         assert!(assistant.len() < DEFAULT_MAX_TOOL_RESULT_CHARS);
 
         let session_dir = context
@@ -448,6 +475,7 @@ mod tests {
 
         assert!(assistant.starts_with(PERSISTED_OUTPUT_TAG));
         assert!(assistant.contains("Full output saved to:"));
+        assert!(assistant.contains("Content sha256: "));
         let session_dir = context
             .current_workspace_session_tool_results_dir("session_1")
             .expect("session tool-results dir");

@@ -57,7 +57,8 @@ use bitfun_agent_tools::{
     generate_tool_result_preview, is_file_tool_guidance_message,
     sanitize_tool_result_file_component, select_tool_result_indices_for_persistence,
     tool_result_is_persisted_output, PersistedToolOutput, ToolResultPersistenceCandidate,
-    FILE_TOOL_GUIDANCE_PREFIX, PERSISTED_OUTPUT_TAG, TOOL_RESULT_PREVIEW_CHARS,
+    FILE_TOOL_GUIDANCE_PREFIX, PERSISTED_OUTPUT_CLOSING_TAG, PERSISTED_OUTPUT_TAG,
+    TOOL_RESULT_PREVIEW_CHARS,
 };
 use bitfun_agent_tools::{
     file_read_facts_are_fresh, file_read_facts_content_matches, normalize_tool_file_content,
@@ -769,6 +770,8 @@ fn persisted_tool_output_message_keeps_reference_preview_and_metadata_shape() {
                 ("exit_code".to_string(), "1".to_string()),
                 ("working_directory".to_string(), "/repo".to_string()),
             ],
+            content_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
         },
         TOOL_RESULT_PREVIEW_CHARS,
     );
@@ -776,10 +779,32 @@ fn persisted_tool_output_message_keeps_reference_preview_and_metadata_shape() {
     assert!(rendered.starts_with(PERSISTED_OUTPUT_TAG));
     assert!(rendered.contains("Output too large (12345 chars). Full output saved to:"));
     assert!(rendered.contains("Line count: 7"));
+    assert!(rendered.contains(
+        "Content sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    ));
     assert!(rendered.contains("Preview (first 2000 chars):\nfirst lines"));
     assert!(rendered.contains("- exit_code: 1"));
     assert!(rendered.contains("- working_directory: /repo"));
     assert!(tool_result_is_persisted_output(&rendered));
+}
+
+#[test]
+fn persisted_tool_output_message_omits_hash_line_when_empty() {
+    let rendered = build_persisted_tool_output_message(
+        &PersistedToolOutput {
+            reference: "bitfun-runtime://session/session-1/tool-results/bash_1.txt".to_string(),
+            original_chars: 12_345,
+            line_count: 7,
+            preview: "first lines".to_string(),
+            has_more: false,
+            metadata: Vec::new(),
+            content_sha256: String::new(),
+        },
+        TOOL_RESULT_PREVIEW_CHARS,
+    );
+
+    assert!(!rendered.contains("Content sha256:"));
+    assert!(rendered.ends_with(PERSISTED_OUTPUT_CLOSING_TAG));
 }
 
 #[test]

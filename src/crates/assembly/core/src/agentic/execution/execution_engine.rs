@@ -3005,10 +3005,12 @@ impl ExecutionEngine {
                         full_compression_count += 1;
                         consecutive_compression_failures = 0;
                         send_pressure_reusable = false;
-                        // Message indices recorded by the deduplicator no longer
-                        // correspond to the post-compression slice; reset so
-                        // future observations are treated as first-occurrences.
-                        observation_deduplicator.reset_after_compression();
+                        // Observations recorded by the deduplicator may no
+                        // longer be present in the post-compression slice;
+                        // reset so future observations are treated as
+                        // first-occurrences, and annotate markers that
+                        // survived compression.
+                        observation_deduplicator.reset_after_compression(&mut messages);
                     }
                     Ok(None) => {
                         debug!("No eligible multi-turn context available for compression");
@@ -3218,11 +3220,7 @@ impl ExecutionEngine {
             // Add tool result messages to history, deduplicating observations
             // whose content is identical to a result already stored this turn.
             for tool_result_msg in round_result.tool_result_messages.iter() {
-                let msg_to_store = observation_deduplicator.apply(
-                    tool_result_msg,
-                    messages.len(),
-                    round_index,
-                );
+                let msg_to_store = observation_deduplicator.apply(tool_result_msg, round_index);
                 messages.push(msg_to_store.clone());
 
                 // Update the in-memory message caches immediately so subsequent rounds see it.

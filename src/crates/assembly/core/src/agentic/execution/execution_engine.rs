@@ -3752,7 +3752,8 @@ impl ExecutionEngine {
         let dedup_stats = observation_deduplicator.take_stats();
         info!(
             "Turn observation dedup stats: turn={}, replacements={}, persisted_hits={}, \
-             skipped_after_edit={}, resets={}, recovery_requests={}, recovery_successes={}, chars_saved={}",
+             skipped_after_edit={}, resets={}, recovery_requests={}, recovery_successes={}, \
+             chars_saved={}, recovery_chars={}",
             context.dialog_turn_id,
             dedup_stats.replacements,
             dedup_stats.persisted_hits,
@@ -3760,7 +3761,8 @@ impl ExecutionEngine {
             dedup_stats.resets,
             dedup_stats.recovery_requests,
             dedup_stats.recovery_successes,
-            dedup_stats.chars_saved
+            dedup_stats.chars_saved,
+            dedup_stats.recovery_chars
         );
 
         let finish_reason = FinishReason::Complete;

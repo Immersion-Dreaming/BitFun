@@ -1,8 +1,8 @@
 //! Cross-round observation deduplication
 //!
-//! When an agent reads the same file or executes the same command multiple times
-//! within a dialog turn and the content is unchanged, storing the full observation
-//! text on every round wastes context tokens. This module tracks a
+//! When an agent reads the same large file range multiple times within a dialog
+//! turn and the content is unchanged, storing the full observation text on every
+//! round wastes context tokens. This module tracks a
 //! content-addressable index of tool-result observations seen within one turn and
 //! replaces exact duplicates with a lightweight reference message.
 //!
@@ -30,12 +30,16 @@ use log::debug;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-/// Minimum visible content length (chars) before we bother deduplicating.
-/// Small results don't meaningfully bloat context; skip them to avoid overhead.
-const MIN_DEDUP_CHARS: usize = 800;
+/// Minimum content length (chars) before a repeated Read is worth replacing.
+///
+/// A marker that makes the model immediately re-read a small source adds a
+/// model/tool round while retaining little context. Keep the threshold high
+/// enough that a skipped large Read can amortize the recovery risk.
+const MIN_DEDUP_CHARS: usize = 8_000;
 
-/// Tool names whose results are never deduplicated regardless of content.
-const EXCLUDED_TOOLS: &[&str] = &["GetToolSpec"];
+/// Only file Reads have a source identity and an unambiguous recovery action.
+/// Other tools can yield identical text for semantically different invocations.
+const DEDUPLICABLE_TOOLS: &[&str] = &["Read"];
 
 /// Tools whose success result mutates a file on disk. When such a file was
 /// edited after an observation was recorded, later reads of the same path
@@ -82,6 +86,9 @@ pub(crate) struct DedupStats {
     /// marker. This must equal `recovery_requests` in the current local
     /// recovery policy.
     pub recovery_successes: usize,
+    /// Characters returned by explicit recovery reads. This is deliberately
+    /// separate from `chars_saved`: recovery can offset the replacement saving.
+    pub recovery_chars: usize,
     /// Characters saved (original content minus marker) across replacements.
     pub chars_saved: usize,
 }
@@ -229,11 +236,8 @@ impl TurnObservationDeduplicator {
             return msg.clone();
         };
 
-        // Never dedup errors, image results, or excluded tool names.
+        // Never dedup errors or images.
         if *is_error {
-            return msg.clone();
-        }
-        if EXCLUDED_TOOLS.contains(&tool_name.as_str()) {
             return msg.clone();
         }
         if image_attachments.as_ref().is_some_and(|a| !a.is_empty()) {
@@ -250,6 +254,13 @@ impl TurnObservationDeduplicator {
         // the recording here too makes standalone callers behave the same.
         if FILE_MUTATION_TOOLS.contains(&tool_name.as_str()) {
             self.record_mutation(msg, round_index);
+            return msg.clone();
+        }
+
+        // Only Read has both a precise source identity and an unambiguous
+        // recovery action. Other tools stay visible even when their text
+        // happens to match a previous result.
+        if !DEDUPLICABLE_TOOLS.contains(&tool_name.as_str()) {
             return msg.clone();
         }
 
@@ -307,6 +318,7 @@ impl TurnObservationDeduplicator {
                 prior.full_delivery = true;
                 self.stats.recovery_requests += 1;
                 self.stats.recovery_successes += 1;
+                self.stats.recovery_chars += content.chars().count();
                 debug!(
                     "Observation recovery restored full result: tool={}, round={}, original_round={}, descriptor={:?}",
                     tool_name, round_index, prior_round, prior_descriptor
@@ -393,15 +405,16 @@ impl TurnObservationDeduplicator {
 ///    before the hash line existed either, so skipping them loses nothing.
 /// 3. **Plain outputs** — the full text.
 ///
-/// Returns `None` when the normalised content is shorter than `MIN_DEDUP_CHARS`
+/// Returns `None` when the original content is shorter than `MIN_DEDUP_CHARS`
 /// (not worth tracking), when the string is empty, or for legacy persisted
-/// outputs.
+/// outputs. Persisted outputs use their header's full-content length rather
+/// than the short visible preview.
 fn compute_dedup_key(result_for_assistant: &str) -> Option<String> {
     if let Some(hash) = parse_content_sha256(result_for_assistant) {
-        // Persisted outputs are normally large, but round-budget persistence
-        // can also compress small results; keep the threshold consistent with
-        // the plain-content path so tiny messages are never deduplicated.
-        if result_for_assistant.chars().count() < MIN_DEDUP_CHARS {
+        let Some(content_chars) = parse_persisted_content_chars(result_for_assistant) else {
+            return None;
+        };
+        if content_chars < MIN_DEDUP_CHARS {
             return None;
         }
         return Some(format!("{PERSISTED_KEY_PREFIX}{hash}"));
@@ -478,6 +491,26 @@ fn parse_content_sha256(text: &str) -> Option<String> {
         if hash.len() == 64 && hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
             return Some(hash.to_ascii_lowercase());
         }
+    }
+    None
+}
+
+/// Parse the original full-content length from the persisted-output header.
+/// The preview is intentionally capped, so its visible length cannot decide
+/// whether the underlying observation is large enough to deduplicate.
+fn parse_persisted_content_chars(text: &str) -> Option<usize> {
+    if !text.starts_with(PERSISTED_OUTPUT_TAG) {
+        return None;
+    }
+    for line in text.lines().take(16) {
+        if line.starts_with(PREVIEW_HEADER_PREFIX) {
+            break;
+        }
+        let Some(rest) = line.strip_prefix("Output too large (") else {
+            continue;
+        };
+        let (digits, _) = rest.split_once(" chars). Full output saved to:")?;
+        return digits.parse().ok();
     }
     None
 }
@@ -758,6 +791,10 @@ mod tests {
         "x".repeat(n)
     }
 
+    fn dedup_candidate() -> String {
+        large(MIN_DEDUP_CHARS)
+    }
+
     fn sha256_hex(content: &str) -> String {
         hex::encode(Sha256::digest(content.as_bytes()))
     }
@@ -801,7 +838,7 @@ mod tests {
     #[test]
     fn second_occurrence_is_replaced() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let content = large(1000);
+        let content = dedup_candidate();
         let msg = make_tool_result_message("Read", &content, false);
         let _ = dedup.apply(&msg, 1);
         let msg2 = make_tool_result_message("Read", &content, false);
@@ -817,7 +854,7 @@ mod tests {
     #[test]
     fn marker_then_exact_reread_restores_and_keeps_full_content() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let body = large(1000);
+        let body = dedup_candidate();
         let read = read_message("src/lib.rs", &body, true);
 
         let _ = dedup.apply(&read, 1);
@@ -841,7 +878,7 @@ mod tests {
     #[test]
     fn edit_reenables_dedup_after_a_recovered_read() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let read = read_message("src/lib.rs", &large(1000), true);
+        let read = read_message("src/lib.rs", &dedup_candidate(), true);
 
         let _ = dedup.apply(&read, 1);
         let _ = dedup.apply(&read, 2);
@@ -867,7 +904,7 @@ mod tests {
     #[test]
     fn persisted_reads_with_identical_payloads_but_different_paths_do_not_dedup() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let body = large(3000);
+        let body = dedup_candidate();
         let persisted = persisted_message(&body, "aabbccdd", Some(&sha256_hex(&body)));
         let first = read_message("src/a.rs", &persisted, false);
         let second = read_message("src/b.rs", &persisted, false);
@@ -883,7 +920,7 @@ mod tests {
     #[test]
     fn identical_content_from_different_read_ranges_does_not_dedup() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let body = large(1000);
+        let body = dedup_candidate();
         let first = read_message_with_range("src/lib.rs", 1, 50, &body, false);
         let second = read_message_with_range("src/lib.rs", 51, 100, &body, false);
 
@@ -898,7 +935,7 @@ mod tests {
     #[test]
     fn marker_is_self_describing_and_has_no_context_position() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let content = large(1000);
+        let content = dedup_candidate();
         let msg = make_tool_result_message("Read", &content, false);
         let _ = dedup.apply(&msg, 3);
         let msg2 = make_tool_result_message("Read", &content, false);
@@ -914,16 +951,28 @@ mod tests {
     #[test]
     fn below_threshold_is_never_deduped() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let content = "short content";
-        let msg = make_tool_result_message("Read", content, false);
+        let content = large(MIN_DEDUP_CHARS - 1);
+        let msg = make_tool_result_message("Read", &content, false);
         let _ = dedup.apply(&msg, 1);
-        let msg2 = make_tool_result_message("Read", content, false);
+        let msg2 = make_tool_result_message("Read", &content, false);
         let out = dedup.apply(&msg2, 2);
         assert_eq!(
             result_text(&out),
             result_text(&msg2),
             "content below threshold must not be replaced"
         );
+    }
+
+    #[test]
+    fn non_read_tool_results_are_never_deduped() {
+        let mut dedup = TurnObservationDeduplicator::new();
+        let content = dedup_candidate();
+        let first = make_tool_result_message("Glob", &content, false);
+        let second = make_tool_result_message("Glob", &content, false);
+
+        let _ = dedup.apply(&first, 1);
+        let out = dedup.apply(&second, 2);
+        assert_eq!(result_text(&out), result_text(&second));
     }
 
     #[test]
@@ -944,7 +993,7 @@ mod tests {
     #[test]
     fn reset_after_compression_clears_state() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let content = large(1000);
+        let content = dedup_candidate();
         let msg = make_tool_result_message("Read", &content, false);
         let _ = dedup.apply(&msg, 1);
 
@@ -963,7 +1012,7 @@ mod tests {
     #[test]
     fn compression_clears_pending_recovery_state() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let read = read_message("src/lib.rs", &large(1000), true);
+        let read = read_message("src/lib.rs", &dedup_candidate(), true);
 
         let _ = dedup.apply(&read, 1);
         let marker = dedup.apply(&read, 2);
@@ -986,7 +1035,7 @@ mod tests {
 
         // Two persisted blobs with different UUID paths but identical content
         // and hash must deduplicate.
-        let content = large(3000);
+        let content = dedup_candidate();
         let sha = sha256_hex(&content);
         let msg1 = make_tool_result_message(
             "Read",
@@ -1010,8 +1059,8 @@ mod tests {
     #[test]
     fn persisted_output_with_different_content_is_not_deduped() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let content1 = large(3000);
-        let content2 = large(3001);
+        let content1 = dedup_candidate();
+        let content2 = large(MIN_DEDUP_CHARS + 1);
         let msg1 = make_tool_result_message(
             "Read",
             &persisted_message(&content1, "aabbccdd", Some(&sha256_hex(&content1))),
@@ -1036,8 +1085,16 @@ mod tests {
         // count — but the content after the preview differs. The full-content
         // hash must catch the difference.
         let mut dedup = TurnObservationDeduplicator::new();
-        let body1 = format!("{}A{}", large(2000), large(1000));
-        let body2 = format!("{}B{}", large(2000), large(1000));
+        let body1 = format!(
+            "{}A{}",
+            large(MIN_DEDUP_CHARS / 2),
+            large(MIN_DEDUP_CHARS / 2)
+        );
+        let body2 = format!(
+            "{}B{}",
+            large(MIN_DEDUP_CHARS / 2),
+            large(MIN_DEDUP_CHARS / 2)
+        );
         assert_eq!(body1.chars().count(), body2.chars().count());
         assert_eq!(body1.lines().count(), body2.lines().count());
 
@@ -1062,7 +1119,7 @@ mod tests {
     #[test]
     fn legacy_persisted_output_without_hash_is_safely_skipped() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let content = large(3000);
+        let content = dedup_candidate();
         let msg1 = make_tool_result_message(
             "Read",
             &persisted_message(&content, "aabbccdd", None),
@@ -1090,8 +1147,14 @@ mod tests {
         // deduplicate.
         let mut dedup = TurnObservationDeduplicator::new();
         let fake_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let body1 = format!("Content sha256: {fake_hash}\nline one\n{}", large(2000));
-        let body2 = format!("Content sha256: {fake_hash}\nline two\n{}", large(2000));
+        let body1 = format!(
+            "Content sha256: {fake_hash}\nline one\n{}",
+            large(MIN_DEDUP_CHARS)
+        );
+        let body2 = format!(
+            "Content sha256: {fake_hash}\nline two\n{}",
+            large(MIN_DEDUP_CHARS)
+        );
 
         let msg1 =
             make_tool_result_message("Read", &persisted_message(&body1, "aabbccdd", None), false);
@@ -1108,18 +1171,18 @@ mod tests {
     #[test]
     fn descriptor_skips_blank_first_line() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let content = format!("\n{}", large(1000));
-        let msg1 = make_tool_result_message("Bash", &content, false);
+        let content = format!("\n{}", dedup_candidate());
+        let msg1 = make_tool_result_message("Read", &content, false);
         let _ = dedup.apply(&msg1, 1);
-        let msg2 = make_tool_result_message("Bash", &content, false);
+        let msg2 = make_tool_result_message("Read", &content, false);
         let out = dedup.apply(&msg2, 2);
         let text = result_text(&out).unwrap_or_default();
         assert!(
-            text.contains("(Bash: xxx"),
+            text.contains("(Read: xxx"),
             "descriptor must use the first non-blank line: {text}"
         );
         assert!(
-            !text.contains("(Bash: )"),
+            !text.contains("(Read: )"),
             "descriptor must never be empty: {text}"
         );
     }
@@ -1127,10 +1190,10 @@ mod tests {
     #[test]
     fn descriptor_strips_control_characters() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let content = format!("\x1b[31mred text\x1b[0m\n{}", large(1000));
-        let msg1 = make_tool_result_message("Bash", &content, false);
+        let content = format!("\x1b[31mred text\x1b[0m\n{}", dedup_candidate());
+        let msg1 = make_tool_result_message("Read", &content, false);
         let _ = dedup.apply(&msg1, 1);
-        let msg2 = make_tool_result_message("Bash", &content, false);
+        let msg2 = make_tool_result_message("Read", &content, false);
         let out = dedup.apply(&msg2, 2);
         let text = result_text(&out).unwrap_or_default();
         assert!(
@@ -1146,7 +1209,7 @@ mod tests {
     #[test]
     fn descriptor_uses_source_path_for_persisted_read() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let body = large(3000);
+        let body = dedup_candidate();
         let sha = sha256_hex(&body);
         let persisted = persisted_message(&body, "aabbccdd", Some(&sha));
         let msg1 = read_message("src/lib.rs", &persisted, false);
@@ -1163,7 +1226,7 @@ mod tests {
     #[test]
     fn same_content_different_paths_do_not_dedup_for_read() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let body = large(1000);
+        let body = dedup_candidate();
         let msg1 = read_message("src/a.rs", &body, true);
         let _ = dedup.apply(&msg1, 1);
         let msg2 = read_message("src/b.rs", &body, true);
@@ -1178,7 +1241,7 @@ mod tests {
     fn read_after_edit_is_kept_fresh_then_rebases() {
         let mut dedup = TurnObservationDeduplicator::new();
         let path = "src/lib.rs";
-        let body = large(1000);
+        let body = dedup_candidate();
         let read_content = format!(
             "Read lines 1-50 from {} (100 total lines)\n<file_content>\n{}\n</file_content>",
             path, body
@@ -1213,7 +1276,7 @@ mod tests {
     #[test]
     fn write_skipped_does_not_suppress_dedup() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let body = large(1000);
+        let body = dedup_candidate();
         let read = read_message("src/lib.rs", &body, true);
 
         let _ = dedup.apply(&read, 1);
@@ -1241,7 +1304,7 @@ mod tests {
     #[test]
     fn path_normalization_matches_dot_prefix() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let body = large(1000);
+        let body = dedup_candidate();
         let read = read_message("src/lib.rs", &body, true);
         let edit = make_tool_result_with_path(
             "Edit",
@@ -1262,7 +1325,7 @@ mod tests {
     #[test]
     fn pre_scan_round_mutations_makes_same_round_edits_visible() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let body = large(1000);
+        let body = dedup_candidate();
         let read = read_message("src/lib.rs", &body, true);
         let edit = make_tool_result_with_path(
             "Edit",
@@ -1290,7 +1353,7 @@ mod tests {
     fn failed_edit_does_not_suppress_dedup() {
         let mut dedup = TurnObservationDeduplicator::new();
         let path = "src/lib.rs";
-        let body = large(1000);
+        let body = dedup_candidate();
         let read_content = format!(
             "Read lines 1-50 from {} (100 total lines)\n<file_content>\n{}\n</file_content>",
             path, body
@@ -1311,7 +1374,7 @@ mod tests {
     #[test]
     fn dedup_stats_count_replacement_recovery_and_savings() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let body = large(1000);
+        let body = dedup_candidate();
         let read = read_message("src/lib.rs", &body, true);
 
         let _ = dedup.apply(&read, 1);
@@ -1340,6 +1403,7 @@ mod tests {
         assert_eq!(stats.resets, 1);
         assert_eq!(stats.recovery_requests, 1);
         assert_eq!(stats.recovery_successes, 1);
+        assert_eq!(stats.recovery_chars, result_text(&read).unwrap_or_default().chars().count());
         assert!(stats.chars_saved > 0);
         assert_eq!(stats.persisted_hits, 0);
     }
@@ -1347,7 +1411,7 @@ mod tests {
     #[test]
     fn persisted_hits_are_counted() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let content = large(3000);
+        let content = dedup_candidate();
         let sha = sha256_hex(&content);
         let msg1 = make_tool_result_message(
             "Read",
@@ -1371,9 +1435,9 @@ mod tests {
     #[test]
     fn different_content_is_not_deduped() {
         let mut dedup = TurnObservationDeduplicator::new();
-        let msg1 = make_tool_result_message("Read", &large(1000), false);
+        let msg1 = make_tool_result_message("Read", &dedup_candidate(), false);
         let _ = dedup.apply(&msg1, 1);
-        let msg2 = make_tool_result_message("Read", &large(1001), false);
+        let msg2 = make_tool_result_message("Read", &large(MIN_DEDUP_CHARS + 1), false);
         let out = dedup.apply(&msg2, 2);
         let text = result_text(&out).unwrap_or_default();
         assert!(

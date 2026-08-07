@@ -335,7 +335,7 @@ impl TurnObservationDeduplicator {
                 tool_name, round_index, prior_round, prior_descriptor
             );
             let replacement = format!(
-                "{DEDUP_MARKER_PREFIX} identical content was already presented at round {} ({}: {}). Omitted to reduce context size. Re-read this exact source once if the full content is needed.]",
+                "{DEDUP_MARKER_PREFIX} identical content was already presented at round {} ({}: {}). Omitted to reduce context size.]",
                 prior_round, prior_tool, prior_descriptor
             );
             self.stats.replacements += 1;
@@ -945,6 +945,10 @@ mod tests {
         assert!(
             !text.contains("context position"),
             "marker must not cite a message position: {text}"
+        );
+        assert!(
+            !text.contains("Re-read"),
+            "marker must not instruct the model to issue another Read: {text}"
         );
     }
 

@@ -1,6 +1,51 @@
 # Lifecycle Estimator Refactor Progress
 
-Updated: 2026-08-06
+Updated: 2026-08-07
+
+## Phase 6: estimator eligibility and event-driven transition repair
+
+Status: implementation complete; targeted unit verification complete; live
+SWE-bench shadow replay pending.
+
+Trace analysis of the 2026-08-06 batch found that 16/16 verifier results
+passed, but the lifecycle estimator was ineffective: it received whole-history
+snapshots, emitted mostly root `active` no-ops, reached the 30-second timeout,
+and never proposed an `evictable` transition. The fix deliberately does not
+relax deterministic protection and does not enable physical eviction.
+
+Implemented:
+
+- Estimation now has an explicit mode: `completion` accepts only
+  `active -> completed`; `eviction` accepts only `completed -> evictable`.
+  The model cannot emit `active`, skip a state, or update a context-only task.
+- The registry computes `eligibleTaskIds`. Eligibility requires a Todo-derived,
+  non-control work unit, at least one ordinary tool segment, completed Todo
+  state, and applicable deterministic protections. Eviction additionally
+  requires later ordinary work owned by another Todo unit in the same root
+  task, proving a reuse horizon.
+- A successful Todo completion with recorded ordinary work triggers an
+  asynchronous completion assessment immediately. Later work and a completed
+  reducer transition can trigger an eviction assessment. The three-tick cadence
+  remains only as a bounded recovery path.
+- Snapshots contain only eligible targets plus at most two segments from the
+  current active Todo as dependency context. Root/control tasks never become
+  estimator targets; unrelated historical tasks and Todo records are omitted.
+- The reducer now rejects task IDs outside `eligibleTaskIds` and lifecycle
+  values that do not match the snapshot mode before applying revision checks.
+- Traces retain the snapshot mode, trigger, eligible IDs, input size, reducer
+  result, and protections for eligible targets only. `physicalEvictionApplied`
+  remains `false`.
+
+Test requirements for the next CLI run:
+
+1. A no-Todo trajectory must show no `lifecycle-estimator-*-scheduled.json`
+   files after the initial recovery attempt.
+2. A sequential Todo trajectory must show a `todo_completed` completion
+   snapshot, followed after later same-root work by an `eviction` snapshot.
+3. A valid model response may produce a shadow candidate, but no context
+   messages, archives, or prompt-cache entries may be modified.
+4. Report estimator request count, input characters, timeout rate, and latency
+   separately from primary-agent token and cache statistics.
 
 ## SWE-bench adaptation plan
 

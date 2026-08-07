@@ -22,6 +22,7 @@ const REGISTRY_SCHEMA_VERSION: u32 = 3;
 const RESULT_PREVIEW_CHARS: usize = 600;
 const LIFECYCLE_BATCH_SIZE: u64 = 3;
 const RECENT_SEGMENTS_TO_PROTECT: u64 = 2;
+const ACTIVE_CONTEXT_SEGMENT_LIMIT: usize = 2;
 const ESTIMATOR_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn default_schema_version() -> u32 {
@@ -37,6 +38,28 @@ pub(crate) enum LifecycleTaskState {
     Active,
     Completed,
     Evictable,
+}
+
+/// The estimator is asked to validate one legal lifecycle transition at a
+/// time. This prevents a generic response from repeatedly reasserting
+/// `active`, or skipping the required completed state on its way to eviction.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LifecycleAssessmentMode {
+    Completion,
+    Eviction,
+}
+
+/// A deterministic event that makes a lifecycle assessment worth scheduling.
+/// Cadence remains a recovery mechanism; it is not the primary transition
+/// signal.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LifecycleScheduleTrigger {
+    Cadence,
+    TodoCompleted,
+    SubsequentWork,
+    StateAdvanced,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -234,6 +257,11 @@ pub(crate) struct LifecycleEstimatorSnapshot {
     pub(crate) created_at_tick: u64,
     pub(crate) current_turn_id: String,
     pub(crate) current_task_id: String,
+    pub(crate) assessment_mode: LifecycleAssessmentMode,
+    /// Only these Todo-derived work units may be updated by the estimator.
+    /// Other tasks in `tasks` are dependency context only.
+    pub(crate) eligible_task_ids: Vec<String>,
+    pub(crate) trigger: LifecycleScheduleTrigger,
     /// The complete source prompt is exposed only for the current user task.
     pub(crate) current_user_prompt: String,
     pub(crate) todos: Vec<LifecycleTodoItem>,
@@ -307,6 +335,12 @@ pub(crate) struct LifecycleWorkUnitProtection {
 struct LifecycleTodoWrite {
     todos: Vec<(String, String, LifecycleTodoStatus)>,
     replaces_root: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LifecycleRecordOutcome {
+    pub(crate) segment_id: String,
+    pub(crate) schedule_trigger: Option<LifecycleScheduleTrigger>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -465,7 +499,7 @@ where
 async fn estimate_snapshot_with_fast_model(
     snapshot: LifecycleEstimatorSnapshot,
 ) -> Result<String, String> {
-    const PROMPT: &str = r#"You are a conservative lifecycle estimator for a software-engineering agent. Return ONLY JSON with this schema: {"snapshotId": string, "taskUpdates": [{"taskId": string, "expectedRevision": number, "lifecycle": "active"|"completed"|"evictable", "completionEvidence": [string], "unresolvedItems": [string]}]}. The currentUserPrompt is the immutable root objective. Each task is a work unit; tasks with source root_fallback or controlOnly true are retained control context and must never be made evictable. Todo tasks refer to current Todo ledger entries by todoIds. Never make a task evictable if a linked Todo is not completed, there is an error, unresolved item, recent activity, a dependency, or uncertainty. A task must first be completed with concrete evidence before it becomes evictable. Use only task IDs and revisions from the input. Prefer no update over a risky update."#;
+    const PROMPT: &str = r#"You are a conservative lifecycle estimator for a software-engineering agent. Return ONLY JSON with this schema: {"snapshotId": string, "taskUpdates": [{"taskId": string, "expectedRevision": number, "lifecycle": "completed"|"evictable", "completionEvidence": [string], "unresolvedItems": [string]}]}. The snapshot contains an assessmentMode and eligibleTaskIds. You may update ONLY an ID in eligibleTaskIds, and every proposed lifecycle MUST equal the one legal transition for assessmentMode: completion -> "completed"; eviction -> "evictable". Tasks outside eligibleTaskIds are read-only dependency context. The currentUserPrompt is the immutable root objective. Prefer no update over uncertainty. For completion, require concrete evidence that the Todo work unit is finished. For eviction, require that evidence remains valid and there are no unresolved items. Never infer or return "active"."#;
     let input = serde_json::to_string(&snapshot)
         .map_err(|error| format!("lifecycle snapshot serialization: {error}"))?;
     let request = async {
@@ -551,6 +585,7 @@ impl LifecycleRegistry {
     /// Records a completed assistant/tool-result round. It intentionally does
     /// not inspect reasoning content: raw chain-of-thought is not a lifecycle
     /// signal and is never copied into estimator input.
+    #[cfg(test)]
     pub(crate) fn record_segment(
         &mut self,
         messages: &[Message],
@@ -558,6 +593,21 @@ impl LifecycleRegistry {
         end_idx: usize,
         turn_id: &str,
     ) -> Option<String> {
+        self.record_segment_with_lifecycle_event(messages, assistant_idx, end_idx, turn_id)
+            .map(|outcome| outcome.segment_id)
+    }
+
+    /// Records one round and reports whether its deterministic facts justify
+    /// an immediate lifecycle assessment. The existing `record_segment` API
+    /// intentionally remains a convenience wrapper for callers that only need
+    /// the durable segment ID.
+    pub(crate) fn record_segment_with_lifecycle_event(
+        &mut self,
+        messages: &[Message],
+        assistant_idx: usize,
+        end_idx: usize,
+        turn_id: &str,
+    ) -> Option<LifecycleRecordOutcome> {
         let MessageContent::Mixed { tool_calls, .. } = &messages.get(assistant_idx)?.content else {
             return None;
         };
@@ -569,7 +619,10 @@ impl LifecycleRegistry {
             tool_calls.iter().map(|call| call.tool_id.clone()).collect();
         let id = format!("{turn_id}:{}", tool_call_ids.join(","));
         if self.segments.contains_key(&id) {
-            return Some(id);
+            return Some(LifecycleRecordOutcome {
+                segment_id: id,
+                schedule_trigger: None,
+            });
         }
 
         let root_task_id = self.ensure_task_for_turn(turn_id);
@@ -652,11 +705,42 @@ impl LifecycleRegistry {
             task.last_activity_tick = self.latest_tick_seq;
             task.revision += 1;
         }
+        let previous_todo_statuses: BTreeMap<String, LifecycleTodoStatus> = self
+            .todo_ledger
+            .iter()
+            .filter(|(_, item)| item.root_task_id == root_task_id)
+            .map(|(key, item)| (key.clone(), item.status))
+            .collect();
         for todo_write in todo_writes {
             self.apply_todo_updates(&root_task_id, todo_write.todos, todo_write.replaces_root);
         }
+        let completed_work_unit_recorded = self.todo_ledger.values().any(|item| {
+            item.root_task_id == root_task_id
+                && item.status == LifecycleTodoStatus::Completed
+                && previous_todo_statuses.get(&item.key) != Some(&LifecycleTodoStatus::Completed)
+                && self
+                    .tasks
+                    .get(&format!("{root_task_id}:todo:{}", item.todo_id))
+                    .is_some_and(|task| self.task_has_ordinary_segment(task))
+        });
+        let schedule_trigger = if completed_work_unit_recorded {
+            Some(LifecycleScheduleTrigger::TodoCompleted)
+        } else if !is_control_segment
+            && self
+                .tasks
+                .get(&owner_task_id)
+                .is_some_and(|task| task.source == LifecycleWorkUnitSource::Todo)
+            && self.has_evictable_assessment_candidate()
+        {
+            Some(LifecycleScheduleTrigger::SubsequentWork)
+        } else {
+            None
+        };
         self.registry_revision += 1;
-        Some(id)
+        Some(LifecycleRecordOutcome {
+            segment_id: id,
+            schedule_trigger,
+        })
     }
 
     fn apply_todo_updates(
@@ -771,22 +855,34 @@ impl LifecycleRegistry {
         task_id
     }
 
-    /// Creates an immutable input every three newly recorded ticks. Scheduling
-    /// state is persisted so a future async coordinator can coalesce snapshots
-    /// without repeatedly submitting the same tick range.
+    /// Creates a cadence snapshot every three newly recorded ticks. Event
+    /// callers should use `schedule_snapshot_for_trigger` so a Todo completion
+    /// is assessed promptly without turning every tool round into model work.
+    #[cfg(test)]
     pub(crate) fn schedule_snapshot(
         &mut self,
         current_turn_id: &str,
     ) -> BitFunResult<Option<LifecycleEstimatorSnapshot>> {
+        self.schedule_snapshot_for_trigger(current_turn_id, LifecycleScheduleTrigger::Cadence)
+    }
+
+    pub(crate) fn schedule_snapshot_for_trigger(
+        &mut self,
+        current_turn_id: &str,
+        trigger: LifecycleScheduleTrigger,
+    ) -> BitFunResult<Option<LifecycleEstimatorSnapshot>> {
         self.validate()?;
-        if self
+        if matches!(
+            trigger,
+            LifecycleScheduleTrigger::Cadence | LifecycleScheduleTrigger::SubsequentWork
+        ) && self
             .latest_tick_seq
             .saturating_sub(self.last_snapshot_tick_seq)
             < LIFECYCLE_BATCH_SIZE
         {
             return Ok(None);
         }
-        self.create_snapshot(current_turn_id)
+        self.create_snapshot(current_turn_id, trigger)
     }
 
     /// Recreates the latest snapshot only when a previous process submitted it
@@ -801,7 +897,7 @@ impl LifecycleRegistry {
         {
             return Ok(None);
         }
-        self.create_snapshot(current_turn_id)
+        self.create_snapshot(current_turn_id, LifecycleScheduleTrigger::Cadence)
     }
 
     pub(crate) fn mark_snapshot_finished(&mut self, snapshot: &LifecycleEstimatorSnapshot) {
@@ -814,6 +910,7 @@ impl LifecycleRegistry {
     fn create_snapshot(
         &mut self,
         current_turn_id: &str,
+        trigger: LifecycleScheduleTrigger,
     ) -> BitFunResult<Option<LifecycleEstimatorSnapshot>> {
         let current_root_task_id = self
             .turn_task_ids
@@ -840,6 +937,20 @@ impl LifecycleRegistry {
             .cloned()
             .unwrap_or_else(|| current_root_task_id.clone());
 
+        let (assessment_mode, eligible_task_ids) = self.assessment_selection();
+        if eligible_task_ids.is_empty() {
+            return Ok(None);
+        }
+        let eligible_task_ids: BTreeSet<String> = eligible_task_ids.into_iter().collect();
+        let mut included_task_ids = eligible_task_ids.clone();
+        if self
+            .tasks
+            .get(&current_task_id)
+            .is_some_and(|task| task.source == LifecycleWorkUnitSource::Todo && !task.control_only)
+        {
+            included_task_ids.insert(current_task_id.clone());
+        }
+
         self.next_snapshot_seq += 1;
         self.last_snapshot_tick_seq = self.latest_tick_seq;
         self.registry_revision += 1;
@@ -847,9 +958,10 @@ impl LifecycleRegistry {
             "lifecycle-snapshot-{}-tick-{}",
             self.next_snapshot_seq, self.latest_tick_seq
         );
-        let tasks = self
+        let tasks: Vec<LifecycleTaskSnapshot> = self
             .tasks
             .values()
+            .filter(|task| included_task_ids.contains(&task.id))
             .map(|task| LifecycleTaskSnapshot {
                 task_id: task.id.clone(),
                 root_task_id: task.root_task_id.clone(),
@@ -858,22 +970,34 @@ impl LifecycleRegistry {
                 todo_ids: task.todo_ids.clone(),
                 expected_revision: task.revision,
                 title: task.title.clone(),
-                normalized_objective: (task.id != current_task_id
-                    && task.id != task.root_task_id
-                    && !task.objective.is_empty())
-                .then(|| task.objective.clone()),
+                normalized_objective: (task.id != task.root_task_id && !task.objective.is_empty())
+                    .then(|| task.objective.clone()),
                 lifecycle: task.lifecycle,
                 acceptance_criteria: task.acceptance_criteria.clone(),
                 completion_evidence: task.completion_evidence.clone(),
                 unresolved_items: task.unresolved_items.clone(),
                 dependencies: task.dependencies.clone(),
                 last_activity_tick: task.last_activity_tick,
-                segments: task
-                    .segment_ids
-                    .iter()
-                    .filter_map(|segment_id| self.segments.get(segment_id).cloned())
-                    .collect(),
+                segments: {
+                    let segment_ids: Vec<&String> = if eligible_task_ids.contains(&task.id) {
+                        task.segment_ids.iter().collect()
+                    } else {
+                        task.segment_ids
+                            .iter()
+                            .rev()
+                            .take(ACTIVE_CONTEXT_SEGMENT_LIMIT)
+                            .collect()
+                    };
+                    segment_ids
+                        .into_iter()
+                        .filter_map(|segment_id| self.segments.get(segment_id).cloned())
+                        .collect()
+                },
             })
+            .collect();
+        let included_todo_ids: BTreeSet<String> = tasks
+            .iter()
+            .flat_map(|task| task.todo_ids.iter().cloned())
             .collect();
         Ok(Some(LifecycleEstimatorSnapshot {
             schema_version: REGISTRY_SCHEMA_VERSION,
@@ -881,10 +1005,116 @@ impl LifecycleRegistry {
             created_at_tick: self.latest_tick_seq,
             current_turn_id: current_turn_id.to_string(),
             current_task_id,
+            assessment_mode,
+            eligible_task_ids: eligible_task_ids.into_iter().collect(),
+            trigger,
             current_user_prompt,
-            todos: self.todo_ledger.values().cloned().collect(),
+            todos: self
+                .todo_ledger
+                .values()
+                .filter(|item| included_todo_ids.contains(&item.key))
+                .cloned()
+                .collect(),
             tasks,
         }))
+    }
+
+    /// Prefer eviction assessments once a previously completed unit has a
+    /// demonstrated later-work horizon. Completion assessments remain pending
+    /// for other finished Todo units and will be picked up by the next event or
+    /// cadence pass.
+    fn assessment_selection(&self) -> (LifecycleAssessmentMode, Vec<String>) {
+        let eviction_candidates: Vec<String> = self
+            .tasks
+            .values()
+            .filter(|task| self.is_evictable_assessment_candidate(task))
+            .map(|task| task.id.clone())
+            .collect();
+        if !eviction_candidates.is_empty() {
+            return (LifecycleAssessmentMode::Eviction, eviction_candidates);
+        }
+        let completion_candidates = self
+            .tasks
+            .values()
+            .filter(|task| self.is_completion_assessment_candidate(task))
+            .map(|task| task.id.clone())
+            .collect();
+        (LifecycleAssessmentMode::Completion, completion_candidates)
+    }
+
+    fn has_evictable_assessment_candidate(&self) -> bool {
+        self.tasks
+            .values()
+            .any(|task| self.is_evictable_assessment_candidate(task))
+    }
+
+    fn is_completion_assessment_candidate(&self, task: &LifecycleTask) -> bool {
+        task.source == LifecycleWorkUnitSource::Todo
+            && !task.control_only
+            && task.lifecycle == LifecycleTaskState::Active
+            && self.task_has_completed_todos(task)
+            && self.task_has_ordinary_segment(task)
+            && !self.completion_is_deterministically_protected(task)
+    }
+
+    fn is_evictable_assessment_candidate(&self, task: &LifecycleTask) -> bool {
+        task.source == LifecycleWorkUnitSource::Todo
+            && !task.control_only
+            && task.lifecycle == LifecycleTaskState::Completed
+            && self.task_has_completed_todos(task)
+            && self.task_has_ordinary_segment(task)
+            && self.has_later_work_unit_activity(task)
+            && !self.task_is_deterministically_protected(&task.id)
+    }
+
+    fn task_has_completed_todos(&self, task: &LifecycleTask) -> bool {
+        !task.todo_ids.is_empty()
+            && task.todo_ids.iter().all(|todo_key| {
+                self.todo_ledger
+                    .get(todo_key)
+                    .is_some_and(|item| item.status == LifecycleTodoStatus::Completed)
+            })
+    }
+
+    fn task_has_ordinary_segment(&self, task: &LifecycleTask) -> bool {
+        task.segment_ids
+            .iter()
+            .filter_map(|segment_id| self.segments.get(segment_id))
+            .any(|segment| !segment.is_control_segment && !segment.evicted)
+    }
+
+    fn completion_is_deterministically_protected(&self, task: &LifecycleTask) -> bool {
+        task.control_only
+            || !self.task_has_completed_todos(task)
+            || task
+                .segment_ids
+                .iter()
+                .filter_map(|segment_id| self.segments.get(segment_id))
+                .any(|segment| segment.has_error || segment.is_control_segment || segment.evicted)
+            || self.tasks.values().any(|other| {
+                other.id != task.id
+                    && other.lifecycle == LifecycleTaskState::Active
+                    && other
+                        .dependencies
+                        .iter()
+                        .any(|dependency| dependency == &task.id)
+            })
+    }
+
+    /// Eviction only has a potential cache benefit when a different work unit
+    /// has actually progressed after the completed unit. Root/control rounds do
+    /// not count as this horizon because they are retained context themselves.
+    fn has_later_work_unit_activity(&self, task: &LifecycleTask) -> bool {
+        self.segments.values().any(|segment| {
+            segment.owner_task_id != task.id
+                && !segment.is_control_segment
+                && segment.tick_seq > task.last_activity_tick
+                && self.tasks.get(&segment.owner_task_id).is_some_and(|owner| {
+                    owner.root_task_id == task.root_task_id
+                        && owner.source == LifecycleWorkUnitSource::Todo
+                        && !owner.control_only
+                })
+        })
     }
 
     /// Applies independently validated task updates. A stale update is rejected
@@ -907,8 +1137,31 @@ impl LifecycleRegistry {
             .iter()
             .map(|task| (task.task_id.as_str(), task.expected_revision))
             .collect();
+        let eligible_task_ids: BTreeSet<&str> = snapshot
+            .eligible_task_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let expected_lifecycle = match snapshot.assessment_mode {
+            LifecycleAssessmentMode::Completion => LifecycleTaskState::Completed,
+            LifecycleAssessmentMode::Eviction => LifecycleTaskState::Evictable,
+        };
         let mut outcome = LifecycleReducerOutcome::default();
         for update in delta.task_updates {
+            if !eligible_task_ids.contains(update.task_id.as_str()) {
+                outcome.rejected_updates.push(LifecycleReducerRejection {
+                    task_id: update.task_id,
+                    reason: "task_not_eligible_for_snapshot".to_string(),
+                });
+                continue;
+            }
+            if update.lifecycle != expected_lifecycle {
+                outcome.rejected_updates.push(LifecycleReducerRejection {
+                    task_id: update.task_id,
+                    reason: "transition_not_allowed_for_snapshot".to_string(),
+                });
+                continue;
+            }
             let Some(snapshot_revision) = expected_revisions.get(update.task_id.as_str()) else {
                 outcome.rejected_updates.push(LifecycleReducerRejection {
                     task_id: update.task_id,
@@ -1677,7 +1930,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_exposes_current_todo_work_unit_without_repeating_root_objective() {
+    fn active_todo_without_completion_never_submits_an_estimator_snapshot() {
         let mut registry = LifecycleRegistry::default();
         let root_prompt = format!("repair the parser {}", "x".repeat(1_500));
         registry.observe_user_turn("turn-1", &root_prompt);
@@ -1688,33 +1941,87 @@ mod tests {
             registry.record_segment(&messages, 0, 2, "turn-1").unwrap();
         }
 
-        let snapshot = registry.schedule_snapshot("turn-1").unwrap().unwrap();
-        let work_unit = snapshot
-            .tasks
-            .iter()
-            .find(|task| task.task_id == "task:turn-1:todo:todo-1")
-            .unwrap();
-        assert_eq!(snapshot.current_user_prompt, root_prompt);
-        assert_eq!(snapshot.current_task_id, work_unit.task_id);
-        assert_eq!(work_unit.source, LifecycleWorkUnitSource::Todo);
-        assert!(!work_unit.control_only);
-        assert_eq!(work_unit.todo_ids, vec!["task:turn-1:todo-1"]);
-        assert_eq!(work_unit.segments.len(), 2);
-        assert_eq!(snapshot.todos.len(), 1);
-        assert_eq!(snapshot.todos[0].status, LifecycleTodoStatus::InProgress);
-        assert!(snapshot
-            .tasks
-            .iter()
-            .find(|task| task.task_id == "task:turn-1")
-            .unwrap()
-            .normalized_objective
-            .is_none());
+        assert!(registry.schedule_snapshot("turn-1").unwrap().is_none());
+        assert_eq!(registry.latest_tick_seq, 3);
         assert_eq!(
-            serde_json::to_string(&snapshot)
-                .unwrap()
-                .matches(&root_prompt)
-                .count(),
-            1
+            registry.active_work_unit_ids["turn-1"],
+            "task:turn-1:todo:todo-1"
+        );
+        assert!(registry.tasks["task:turn-1:todo:todo-1"].segment_ids.len() == 2);
+    }
+
+    #[test]
+    fn todo_completion_event_bypasses_cadence_and_targets_only_that_work_unit() {
+        let mut registry = LifecycleRegistry::default();
+        registry.observe_user_turn("turn-1", "repair the parser");
+        registry.record_segment(
+            &todo_round("turn-1", "start", "todo-1", "in_progress"),
+            0,
+            2,
+            "turn-1",
+        );
+        registry.record_segment(&round("turn-1", "work", false, false), 0, 2, "turn-1");
+        // Model a just-finished cadence batch: the completion below is only
+        // one tick later and must still be assessed immediately.
+        registry.last_snapshot_tick_seq = registry.latest_tick_seq;
+        let completion = registry
+            .record_segment_with_lifecycle_event(
+                &todo_round("turn-1", "finish", "todo-1", "completed"),
+                0,
+                2,
+                "turn-1",
+            )
+            .unwrap();
+        assert_eq!(
+            completion.schedule_trigger,
+            Some(LifecycleScheduleTrigger::TodoCompleted)
+        );
+        let snapshot = registry
+            .schedule_snapshot_for_trigger("turn-1", completion.schedule_trigger.unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot.assessment_mode,
+            LifecycleAssessmentMode::Completion
+        );
+        assert_eq!(
+            snapshot.eligible_task_ids,
+            vec!["task:turn-1:todo:todo-1".to_string()]
+        );
+        assert_eq!(snapshot.tasks.len(), 1);
+        assert_eq!(snapshot.tasks[0].segments.len(), 1);
+    }
+
+    #[test]
+    fn reducer_rejects_context_task_not_listed_as_eligible() {
+        let (mut registry, snapshot, _, _) = snapshot_with_two_tasks();
+        let task_id = "task:turn-1:todo:todo-1";
+        let revision = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == task_id)
+            .unwrap()
+            .expected_revision;
+        let mut restricted_snapshot = snapshot.clone();
+        restricted_snapshot.eligible_task_ids = vec!["task:turn-1:todo:todo-2".to_string()];
+        let outcome = registry
+            .reduce_estimator_delta(
+                &restricted_snapshot,
+                LifecycleEstimatorDelta {
+                    snapshot_id: restricted_snapshot.snapshot_id.clone(),
+                    task_updates: vec![update(
+                        task_id,
+                        revision,
+                        LifecycleTaskState::Completed,
+                        &["model tried to update read-only context"],
+                    )],
+                },
+            )
+            .unwrap();
+        assert!(outcome.applied_task_ids.is_empty());
+        assert_eq!(
+            outcome.rejected_updates[0].reason,
+            "task_not_eligible_for_snapshot"
         );
     }
 
@@ -1947,19 +2254,33 @@ mod tests {
         let old_prompt = format!("old objective {}", "a".repeat(1_300));
         let current_prompt = format!("current objective {}", "b".repeat(1_500));
         registry.observe_user_turn("turn-1", &old_prompt);
-        for suffix in ["one", "two"] {
-            let messages = round("turn-1", suffix, false, false);
-            registry.record_segment(&messages, 0, 2, "turn-1");
-        }
+        registry.record_segment(
+            &todo_round("turn-1", "start-one", "todo-1", "in_progress"),
+            0,
+            2,
+            "turn-1",
+        );
+        registry.record_segment(&round("turn-1", "work-one", false, false), 0, 2, "turn-1");
+        registry.record_segment(
+            &todo_round("turn-1", "finish-one", "todo-1", "completed"),
+            0,
+            2,
+            "turn-1",
+        );
+        registry.record_segment(
+            &todo_round("turn-1", "start-two", "todo-2", "in_progress"),
+            0,
+            2,
+            "turn-1",
+        );
+        registry.record_segment(&round("turn-1", "work-two", false, false), 0, 2, "turn-1");
+        registry.record_segment(
+            &todo_round("turn-1", "finish-two", "todo-2", "completed"),
+            0,
+            2,
+            "turn-1",
+        );
         registry.observe_user_turn("turn-2", &current_prompt);
-        let messages = round("turn-2", "three", false, false);
-        registry.record_segment(&messages, 0, 2, "turn-2");
-        // This fixture models explicit non-control work units so reducer and
-        // candidate tests can exercise the legal transition independently of
-        // the production no-Todo fallback rule.
-        for task in registry.tasks.values_mut() {
-            task.control_only = false;
-        }
         let snapshot = registry.schedule_snapshot("turn-2").unwrap().unwrap();
         (registry, snapshot, old_prompt, current_prompt)
     }
@@ -1967,16 +2288,21 @@ mod tests {
     #[test]
     fn snapshot_runs_per_three_ticks_and_only_repeats_current_raw_prompt() {
         let (mut registry, snapshot, old_prompt, current_prompt) = snapshot_with_two_tasks();
-        assert_eq!(snapshot.created_at_tick, 3);
+        assert_eq!(snapshot.created_at_tick, 6);
         assert_eq!(snapshot.current_user_prompt, current_prompt);
         assert_eq!(snapshot.tasks.len(), 2);
+        assert_eq!(
+            snapshot.assessment_mode,
+            LifecycleAssessmentMode::Completion
+        );
+        assert_eq!(snapshot.eligible_task_ids.len(), 2);
         assert!(snapshot
             .tasks
             .iter()
-            .find(|task| task.task_id == "task:turn-1")
+            .find(|task| task.task_id == "task:turn-1:todo:todo-1")
             .unwrap()
             .normalized_objective
-            .is_none());
+            .is_some());
         let serialized = serde_json::to_string(&snapshot).unwrap();
         assert!(!serialized.contains(&old_prompt));
         assert!(!serialized.contains("reasoning_content"));
@@ -1986,7 +2312,7 @@ mod tests {
     #[test]
     fn unfinished_snapshot_is_recovered_once_after_restart() {
         let (mut registry, first_snapshot, _, _) = snapshot_with_two_tasks();
-        assert_eq!(registry.last_snapshot_tick_seq, 3);
+        assert_eq!(registry.last_snapshot_tick_seq, 6);
         assert_eq!(registry.last_finished_snapshot_tick_seq, 0);
 
         let recovery_snapshot = registry
@@ -1999,7 +2325,7 @@ mod tests {
             first_snapshot.created_at_tick
         );
         registry.mark_snapshot_finished(&recovery_snapshot);
-        assert_eq!(registry.last_finished_snapshot_tick_seq, 3);
+        assert_eq!(registry.last_finished_snapshot_tick_seq, 6);
         assert!(registry
             .schedule_recovery_snapshot("turn-2")
             .unwrap()
@@ -2009,21 +2335,24 @@ mod tests {
     #[test]
     fn stale_task_update_does_not_discard_fresh_update_for_another_task() {
         let (mut registry, snapshot, _, _) = snapshot_with_two_tasks();
+        let first_task_id = "task:turn-1:todo:todo-1";
+        let second_task_id = "task:turn-1:todo:todo-2";
         let old_revision = snapshot
             .tasks
             .iter()
-            .find(|task| task.task_id == "task:turn-1")
+            .find(|task| task.task_id == first_task_id)
             .unwrap()
             .expected_revision;
         let current_revision = snapshot
             .tasks
             .iter()
-            .find(|task| task.task_id == "task:turn-2")
+            .find(|task| task.task_id == second_task_id)
             .unwrap()
             .expected_revision;
 
-        let messages = round("turn-1", "after-snapshot", false, false);
-        registry.record_segment(&messages, 0, 2, "turn-1");
+        // A deterministic fact changed after the snapshot, making only the
+        // first target stale while the second target remains applicable.
+        registry.tasks.get_mut(first_task_id).unwrap().revision += 1;
         let outcome = registry
             .reduce_estimator_delta(
                 &snapshot,
@@ -2031,13 +2360,13 @@ mod tests {
                     snapshot_id: snapshot.snapshot_id.clone(),
                     task_updates: vec![
                         update(
-                            "task:turn-1",
+                            first_task_id,
                             old_revision,
                             LifecycleTaskState::Completed,
                             &["old task done"],
                         ),
                         update(
-                            "task:turn-2",
+                            second_task_id,
                             current_revision,
                             LifecycleTaskState::Completed,
                             &["current task done"],
@@ -2046,14 +2375,14 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(outcome.applied_task_ids, vec!["task:turn-2"]);
+        assert_eq!(outcome.applied_task_ids, vec![second_task_id]);
         assert_eq!(outcome.rejected_updates[0].reason, "stale_task_revision");
         assert_eq!(
-            registry.tasks["task:turn-2"].lifecycle,
+            registry.tasks[second_task_id].lifecycle,
             LifecycleTaskState::Completed
         );
         assert_eq!(
-            registry.tasks["task:turn-1"].lifecycle,
+            registry.tasks[first_task_id].lifecycle,
             LifecycleTaskState::Active
         );
     }
@@ -2061,10 +2390,11 @@ mod tests {
     #[test]
     fn reducer_rejects_direct_active_to_evictable_transition() {
         let (mut registry, snapshot, _, _) = snapshot_with_two_tasks();
+        let task_id = "task:turn-1:todo:todo-1";
         let revision = snapshot
             .tasks
             .iter()
-            .find(|task| task.task_id == "task:turn-1")
+            .find(|task| task.task_id == task_id)
             .unwrap()
             .expected_revision;
         let outcome = registry
@@ -2073,7 +2403,7 @@ mod tests {
                 LifecycleEstimatorDelta {
                     snapshot_id: snapshot.snapshot_id.clone(),
                     task_updates: vec![update(
-                        "task:turn-1",
+                        task_id,
                         revision,
                         LifecycleTaskState::Evictable,
                         &["not enough"],
@@ -2084,17 +2414,18 @@ mod tests {
         assert!(outcome.applied_task_ids.is_empty());
         assert_eq!(
             outcome.rejected_updates[0].reason,
-            "direct_active_to_evictable_transition"
+            "transition_not_allowed_for_snapshot"
         );
     }
 
     #[test]
     fn completed_old_task_becomes_a_shadow_candidate_only_after_guards_pass() {
         let (mut registry, first_snapshot, _, _) = snapshot_with_two_tasks();
+        let first_task_id = "task:turn-1:todo:todo-1";
         let first_revision = first_snapshot
             .tasks
             .iter()
-            .find(|task| task.task_id == "task:turn-1")
+            .find(|task| task.task_id == first_task_id)
             .unwrap()
             .expected_revision;
         registry
@@ -2103,7 +2434,7 @@ mod tests {
                 LifecycleEstimatorDelta {
                     snapshot_id: first_snapshot.snapshot_id.clone(),
                     task_updates: vec![update(
-                        "task:turn-1",
+                        first_task_id,
                         first_revision,
                         LifecycleTaskState::Completed,
                         &["inspection finished"],
@@ -2112,15 +2443,28 @@ mod tests {
             )
             .unwrap();
 
-        for suffix in ["four", "five", "six"] {
-            let messages = round("turn-2", suffix, false, false);
-            registry.record_segment(&messages, 0, 2, "turn-2");
+        registry.record_segment(
+            &todo_round("turn-1", "start-three", "todo-3", "in_progress"),
+            0,
+            2,
+            "turn-1",
+        );
+        for suffix in ["work-three-a", "work-three-b"] {
+            registry.record_segment(&round("turn-1", suffix, false, false), 0, 2, "turn-1");
         }
         let second_snapshot = registry.schedule_snapshot("turn-2").unwrap().unwrap();
+        assert_eq!(
+            second_snapshot.assessment_mode,
+            LifecycleAssessmentMode::Eviction
+        );
+        assert_eq!(
+            second_snapshot.eligible_task_ids,
+            vec![first_task_id.to_string()]
+        );
         let first_revision = second_snapshot
             .tasks
             .iter()
-            .find(|task| task.task_id == "task:turn-1")
+            .find(|task| task.task_id == first_task_id)
             .unwrap()
             .expected_revision;
         let outcome = registry
@@ -2129,7 +2473,7 @@ mod tests {
                 LifecycleEstimatorDelta {
                     snapshot_id: second_snapshot.snapshot_id.clone(),
                     task_updates: vec![update(
-                        "task:turn-1",
+                        first_task_id,
                         first_revision,
                         LifecycleTaskState::Evictable,
                         &["inspection finished"],
@@ -2137,95 +2481,48 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(outcome.applied_task_ids, vec!["task:turn-1"]);
+        assert_eq!(outcome.applied_task_ids, vec![first_task_id]);
         assert_eq!(
             registry.shadow_candidate_segment_ids(),
-            vec!["turn-1:one-read".to_string(), "turn-1:two-read".to_string()]
+            vec!["turn-1:work-one-read".to_string()]
         );
     }
 
     #[test]
     fn deterministic_error_or_pending_todo_prevents_evictable_transition() {
-        for (error, pending) in [(true, false), (false, true)] {
+        for (error, complete_todo) in [(true, true), (false, false)] {
             let mut registry = LifecycleRegistry::default();
             registry.observe_user_turn("turn-1", "risky task");
-            let messages = round("turn-1", "one", error, pending);
-            registry.record_segment(&messages, 0, 2, "turn-1");
-            for suffix in ["two", "three", "four", "five", "six"] {
-                registry.observe_user_turn("turn-2", "other task");
-                let messages = round("turn-2", suffix, false, false);
-                registry.record_segment(&messages, 0, 2, "turn-2");
-            }
-            let snapshot = registry.schedule_snapshot("turn-2").unwrap().unwrap();
-            let task_one_revision = snapshot
-                .tasks
-                .iter()
-                .find(|task| task.task_id == "task:turn-1")
-                .unwrap()
-                .expected_revision;
-            registry
-                .reduce_estimator_delta(
-                    &snapshot,
-                    LifecycleEstimatorDelta {
-                        snapshot_id: snapshot.snapshot_id.clone(),
-                        task_updates: vec![update(
-                            "task:turn-1",
-                            task_one_revision,
-                            LifecycleTaskState::Completed,
-                            &["finished despite bad intermediate result"],
-                        )],
-                    },
-                )
-                .unwrap();
-            let next_snapshot = registry.schedule_snapshot("turn-2").unwrap();
-            assert!(next_snapshot.is_none());
-            let task_one_revision = registry.tasks["task:turn-1"].revision;
-            let synthetic_snapshot = LifecycleEstimatorSnapshot {
-                schema_version: REGISTRY_SCHEMA_VERSION,
-                snapshot_id: "test-snapshot".to_string(),
-                created_at_tick: registry.latest_tick_seq,
-                current_turn_id: "turn-2".to_string(),
-                current_task_id: "task:turn-2".to_string(),
-                current_user_prompt: "other task".to_string(),
-                todos: vec![],
-                tasks: vec![LifecycleTaskSnapshot {
-                    task_id: "task:turn-1".to_string(),
-                    root_task_id: "task:turn-1".to_string(),
-                    source: LifecycleWorkUnitSource::Todo,
-                    control_only: false,
-                    todo_ids: vec![],
-                    expected_revision: task_one_revision,
-                    title: None,
-                    normalized_objective: None,
-                    lifecycle: LifecycleTaskState::Completed,
-                    acceptance_criteria: vec![],
-                    completion_evidence: vec![
-                        "finished despite bad intermediate result".to_string()
-                    ],
-                    unresolved_items: vec![],
-                    dependencies: vec![],
-                    last_activity_tick: 1,
-                    segments: vec![],
-                }],
-            };
-            let outcome = registry
-                .reduce_estimator_delta(
-                    &synthetic_snapshot,
-                    LifecycleEstimatorDelta {
-                        snapshot_id: "test-snapshot".to_string(),
-                        task_updates: vec![update(
-                            "task:turn-1",
-                            task_one_revision,
-                            LifecycleTaskState::Evictable,
-                            &["finished despite bad intermediate result"],
-                        )],
-                    },
-                )
-                .unwrap();
-            assert_eq!(
-                outcome.rejected_updates[0].reason,
-                "evictable_task_is_deterministically_protected"
+            registry.record_segment(
+                &todo_round("turn-1", "start", "todo-1", "in_progress"),
+                0,
+                2,
+                "turn-1",
             );
+            registry.record_segment(&round("turn-1", "work", error, false), 0, 2, "turn-1");
+            if complete_todo {
+                registry.record_segment(
+                    &todo_round("turn-1", "finish", "todo-1", "completed"),
+                    0,
+                    2,
+                    "turn-1",
+                );
+            }
+            let task_id = "task:turn-1:todo:todo-1";
+            registry.tasks.get_mut(task_id).unwrap().lifecycle = LifecycleTaskState::Completed;
+            registry.tasks.get_mut(task_id).unwrap().completion_evidence = vec!["done".into()];
+            registry.record_segment(
+                &todo_round("turn-1", "start-two", "todo-2", "in_progress"),
+                0,
+                2,
+                "turn-1",
+            );
+            for suffix in ["later-one", "later-two"] {
+                registry.record_segment(&round("turn-1", suffix, false, false), 0, 2, "turn-1");
+            }
+            assert!(registry.task_is_deterministically_protected(task_id));
+            assert!(!registry.is_evictable_assessment_candidate(&registry.tasks[task_id]));
+            assert!(registry.schedule_snapshot("turn-1").unwrap().is_none());
         }
     }
 

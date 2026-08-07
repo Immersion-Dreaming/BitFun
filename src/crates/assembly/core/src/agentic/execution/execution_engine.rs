@@ -2815,8 +2815,13 @@ impl ExecutionEngine {
                 .await
                 .has_work(&context.session_id);
             if !has_lifecycle_work {
-                self.schedule_lifecycle_estimator(registry, &context, true)
-                    .await;
+                self.schedule_lifecycle_estimator(
+                    registry,
+                    &context,
+                    true,
+                    super::lifecycle_evict::LifecycleScheduleTrigger::Cadence,
+                )
+                .await;
             }
         }
 
@@ -3300,13 +3305,16 @@ impl ExecutionEngine {
             // Scheduling is async shadow analysis only: no message rewrite,
             // archive write, or prompt-cache invalidation is permitted here.
             if let Some(registry) = lifecycle_registry.as_mut() {
-                registry.record_segment(
+                let lifecycle_event = registry.record_segment_with_lifecycle_event(
                     &messages,
                     lifecycle_assistant_msg_idx,
                     messages.len(),
                     &context.dialog_turn_id,
                 );
-                self.schedule_lifecycle_estimator(registry, &context, false)
+                let trigger = lifecycle_event
+                    .and_then(|outcome| outcome.schedule_trigger)
+                    .unwrap_or(super::lifecycle_evict::LifecycleScheduleTrigger::Cadence);
+                self.schedule_lifecycle_estimator(registry, &context, false, trigger)
                     .await;
             }
 
@@ -3927,11 +3935,12 @@ impl ExecutionEngine {
         registry: &mut super::lifecycle_evict::LifecycleRegistry,
         context: &ExecutionContext,
         recovery: bool,
+        trigger: super::lifecycle_evict::LifecycleScheduleTrigger,
     ) {
         let snapshot_result = if recovery {
             registry.schedule_recovery_snapshot(&context.dialog_turn_id)
         } else {
-            registry.schedule_snapshot(&context.dialog_turn_id)
+            registry.schedule_snapshot_for_trigger(&context.dialog_turn_id, trigger)
         };
         let snapshot = match snapshot_result {
             Ok(Some(snapshot)) => snapshot,
@@ -3969,6 +3978,7 @@ impl ExecutionEngine {
                 "physicalEvictionApplied": false,
                 "outcome": disposition,
                 "recoverySubmission": recovery,
+                "trigger": trigger,
                 "snapshot": snapshot,
                 "estimatorInputChars": input_chars,
             }),
@@ -4000,6 +4010,7 @@ impl ExecutionEngine {
                 "snapshot": worker_result.snapshot.clone(),
                 "estimatorDurationMs": worker_result.duration_ms,
             });
+            let mut schedule_eviction_follow_up = false;
             match worker_result.response {
                 Err(error) => {
                     trace["outcome"] = serde_json::json!("estimator_failed");
@@ -4022,7 +4033,24 @@ impl ExecutionEngine {
                             }
                             Ok(outcome) => {
                                 let candidate_segment_ids = registry.shadow_candidate_segment_ids();
-                                let work_unit_protection = registry.work_unit_protection_reasons();
+                                let work_unit_protection = registry
+                                    .work_unit_protection_reasons()
+                                    .into_iter()
+                                    .filter(|entry| {
+                                        worker_result
+                                            .snapshot
+                                            .eligible_task_ids
+                                            .contains(&entry.task_id)
+                                    })
+                                    .collect::<Vec<_>>();
+                                schedule_eviction_follow_up = outcome.applied_task_ids.iter().any(
+                                    |task_id| {
+                                        registry.tasks.get(task_id).is_some_and(|task| {
+                                            task.lifecycle
+                                                == super::lifecycle_evict::LifecycleTaskState::Completed
+                                        })
+                                    },
+                                );
                                 trace["outcome"] =
                                     serde_json::json!(if outcome.applied_task_ids.is_empty() {
                                         "delta_no_task_update"
@@ -4047,6 +4075,15 @@ impl ExecutionEngine {
                 &format!("{snapshot_id}-completed"),
                 trace,
             );
+            if schedule_eviction_follow_up {
+                self.schedule_lifecycle_estimator(
+                    registry,
+                    context,
+                    false,
+                    super::lifecycle_evict::LifecycleScheduleTrigger::StateAdvanced,
+                )
+                .await;
+            }
         }
     }
 
